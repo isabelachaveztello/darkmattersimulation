@@ -8,7 +8,6 @@ mm = 1e-3;
 kg = 1.66053907e-27; # converts AMU to kg
 AMU = 6.022e26
 K = 8.9875e9;
-CHARGE = 1.6e-19;
 Z = 1; # ion charge number
 e = 1.62176634e-19 # elementary charge
 m = 171*kg; # mass (Yb 171 ion)
