@@ -13,6 +13,7 @@ e = 1.62176634e-19 # elementary charge
 m = 171*kg; # mass (Yb 171 ion)
 z0 = -11.8*um; # location of ground plane (next to M3)
 z_image_M4 = 2*z0; # z position of image DC voltages from M4
+ion_height = 70.00357133746822e-6 # height of ion relative to RF ground
 
 ## electrode geometry
 lcs = 2069.6*2*um; # central slot length
