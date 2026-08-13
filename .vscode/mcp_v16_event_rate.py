@@ -7,7 +7,7 @@ screening estimator and an adaptive solve_ivp staged ODE estimator.
 """
 from __future__ import annotations
 
-MODULE_VERSION = "2026-08-12.4"
+MODULE_VERSION = "2026-08-13.2"
 
 from dataclasses import dataclass, asdict, replace, field
 from pathlib import Path
@@ -1899,6 +1899,20 @@ class ConvergenceConfig:
     b_tail_factor_2: float = 4.0
     b_tail_fraction_tol: float = 0.05
     b_tail_decay_factor: float = 1.25
+    # Adaptive impact-parameter support.  The nominal Rutherford b_max is only
+    # the initial support radius.  When the explicit outer-annulus audit fails,
+    # the central integral is enlarged geometrically while preserving the old
+    # [0,B] Monte Carlo estimate and adding independently sampled annuli.
+    adaptive_bmax_enabled: bool = True
+    adaptive_bmax_max_expansions: int = 8
+    adaptive_bmax_max_factor: float = 256.0
+    # Before enlarging support, increase the annulus statistics when the
+    # apparent failure is consistent with tail-estimator noise.  This lets us
+    # distinguish a genuinely long physical tail from a 128-sample upper-bound
+    # fluctuation, while reusing previous annulus summaries whenever possible.
+    adaptive_bmax_tail_max_samples: int = 1024
+    adaptive_bmax_tail_sample_growth: float = 2.0
+    adaptive_bmax_version: int = 2
     numerical_rel_tol: float = 0.05
     confidence_z: float = 2.0
     outer_radius_factor: float = 1.5
@@ -1963,14 +1977,21 @@ def _importance_sample_contribution(
     i: int,
     *,
     b_annulus_factors: tuple[float, float] | None = None,
+    b_support_factor: float = 1.0,
 ) -> dict:
     """Evaluate one staged importance sample.
 
+    ``b_support_factor`` multiplies the nominal Rutherford ``B(v)`` for an
+    ordinary central-support draw.  This is used by the paired numerical audit
+    after an adaptive b_max expansion so baseline and numerical variants probe
+    the same enlarged physical support.
+
     When ``b_annulus_factors`` is supplied, the sample is drawn uniformly in
     transverse area from the annulus [f_lo B(v), f_hi B(v)], where B(v) is the
-    nominal b_max for that speed.  The returned weight is then exactly the
-    annulus area pi(b_hi^2-b_lo^2), so the estimator directly measures the
-    omitted b-tail rather than relying on the straight-line cutoff formula.
+    *original* nominal Rutherford b_max for that speed.  The returned weight is
+    exactly the annulus area pi(b_hi^2-b_lo^2), so independently estimated
+    annuli can be added to an already-computed [0,B] checkpoint result without
+    rerunning those expensive central trajectories.
     """
     vscale = math.sqrt(2 * KB * cfg.temperature_K / m_dm)
     speed = float(common["x_speed"][i]) * vscale
@@ -1979,8 +2000,13 @@ def _importance_sample_contribution(
     clipped = False
 
     if b_annulus_factors is None:
+        factor = max(float(b_support_factor), 1.0)
+        b_requested = factor * b_nominal
+        b_limit = 0.80 * cfg.R_outer_m
+        b_support = min(b_requested, b_limit)
+        clipped = bool(b_requested > b_limit * (1.0 + 1e-12))
         b, area_weight = sample_b_with_weight(
-            b_nominal,
+            b_support,
             float(common["mix"][i]),
             float(common["u_b"][i]),
             cfg,
@@ -2042,6 +2068,7 @@ def point_sample_contributions(
     *,
     seed: int | None = None,
     b_annulus_factors: tuple[float, float] | None = None,
+    b_support_factor: float = 1.0,
     progress: bool = False,
 ) -> dict:
     """Return raw per-sample staged rate contributions for one valid point."""
@@ -2066,6 +2093,7 @@ def point_sample_contributions(
         rec = _importance_sample_contribution(
             m_dm, eps, cfg, ground, common, i,
             b_annulus_factors=b_annulus_factors,
+            b_support_factor=b_support_factor,
         )
         for key in out:
             out[key].append(rec[key])
@@ -2184,6 +2212,378 @@ def _paired_convergence_metric(base: np.ndarray, variant: np.ndarray, z: float) 
     }
 
 
+def _baseline_standard_error(baseline: dict, label: str) -> float:
+    for key in (f"{label}_mc_se_s", f"{label}_se_s"):
+        try:
+            value = float(baseline.get(key, np.nan))
+        except (TypeError, ValueError):
+            value = np.nan
+        if np.isfinite(value) and value >= 0.0:
+            return value
+    rate_key = {
+        "phonon": "phonon_rate_s", "ge1": "event_rate_ge1_s", "exact_M": "event_rate_exact_M_s"
+    }[label]
+    try:
+        rate = float(baseline.get(rate_key, np.nan))
+        rel = float(baseline.get(f"{label}_mc_rel_se", np.nan))
+    except (TypeError, ValueError):
+        return np.nan
+    return abs(rate) * rel if np.isfinite(rate) and np.isfinite(rel) else np.nan
+
+
+def _summary_from_mean_se(mean: float, se: float, n: int) -> dict:
+    n = max(int(n), 0)
+    return {"mean": float(mean), "se": float(se), "n": n}
+
+
+def _combine_metric_summaries(a: dict, b: dict) -> dict:
+    """Pool two independent sample summaries without requiring raw samples."""
+    n1 = int(a.get("n", 0)); n2 = int(b.get("n", 0))
+    if n1 <= 0:
+        return dict(b)
+    if n2 <= 0:
+        return dict(a)
+    m1 = float(a.get("mean", np.nan)); m2 = float(b.get("mean", np.nan))
+    e1 = float(a.get("se", np.nan)); e2 = float(b.get("se", np.nan))
+    if not (np.isfinite(m1) and np.isfinite(m2)):
+        return {"mean": np.nan, "se": np.nan, "n": n1 + n2}
+    # se = sample_std/sqrt(n). Recover the within-block M2 when possible.
+    def m2_from(n, se):
+        if n <= 1 or not np.isfinite(se):
+            return 0.0 if n <= 1 else np.nan
+        var = (se * math.sqrt(n)) ** 2
+        return (n - 1) * var
+    M21 = m2_from(n1, e1); M22 = m2_from(n2, e2)
+    n = n1 + n2
+    mean = (n1 * m1 + n2 * m2) / n
+    if np.isfinite(M21) and np.isfinite(M22) and n > 1:
+        delta = m2 - m1
+        M2 = M21 + M22 + delta * delta * n1 * n2 / n
+        sample_var = max(M2 / (n - 1), 0.0)
+        se = math.sqrt(sample_var / n)
+    else:
+        se = np.nan
+    return {"mean": float(mean), "se": float(se), "n": int(n)}
+
+
+def _tail_sample_count_from_legacy_row(row: dict, conv: ConvergenceConfig) -> int:
+    """Infer per-annulus N from an older adaptive-b checkpoint row."""
+    try:
+        n1 = int(float(row.get("b_tail1_n", 0) or 0))
+        n2 = int(float(row.get("b_tail2_n", 0) or 0))
+        if n1 > 0 and n2 > 0:
+            return min(n1, n2)
+    except Exception:
+        pass
+    try:
+        total = int(float(row.get("adaptive_bmax_tail_samples", 0) or 0))
+        expansions = int(float(row.get("adaptive_bmax_expansions", 0) or 0))
+        denom = 2 + max(expansions, 0)
+        if total > 0 and denom > 0:
+            guess = int(round(total / denom))
+            if guess > 0:
+                return guess
+    except Exception:
+        pass
+    return max(int(conv.b_tail_samples), 2)
+
+
+def _reusable_tail_summaries(row: dict, conv: ConvergenceConfig):
+    """Return the final two annulus summaries already stored in a checkpoint."""
+    labels = ("phonon", "ge1", "exact_M")
+    n = _tail_sample_count_from_legacy_row(row, conv)
+    ann1 = {"metrics": {}, "clipped": _safe_bool(row.get("b_tail_clipped", False), False)}
+    ann2 = {"metrics": {}, "clipped": _safe_bool(row.get("b_tail_clipped", False), False)}
+    for label in labels:
+        vals = []
+        for prefix in ("b_tail1", "b_tail2"):
+            try:
+                mean = float(row.get(f"{prefix}_{label}_rate_s", np.nan))
+                se = float(row.get(f"{prefix}_{label}_se_s", np.nan))
+            except Exception:
+                mean = se = np.nan
+            vals.append((mean, se))
+        if not all(np.isfinite(x) for pair in vals for x in pair):
+            return None, None
+        ann1["metrics"][label] = _summary_from_mean_se(vals[0][0], vals[0][1], n)
+        ann2["metrics"][label] = _summary_from_mean_se(vals[1][0], vals[1][1], n)
+    ann1["n"] = n; ann2["n"] = n
+    return ann1, ann2
+
+
+def _adaptive_b_tail_test(
+    m_dm: float,
+    eps: float,
+    cfg: ScanConfig,
+    ground: CopperGroundPlane,
+    conv: ConvergenceConfig,
+    baseline: dict,
+    *,
+    seed: int,
+    progress: bool = False,
+    checkpoint_callback=None,
+) -> dict:
+    """Repair/enlarge impact-parameter support while reusing previous results.
+
+    Version 2 is deliberately incremental.  If ``baseline`` already contains a
+    v1 adaptive-b result, its enlarged central estimate and final two annulus
+    summaries are reused.  The algorithm first increases annulus statistics
+    when a failed 2-sigma bound is statistically ambiguous.  It expands the
+    physical support only when the tail is demonstrably too large (or after the
+    configured tail-sample ceiling is reached).  Thus a 32B result is continued
+    from 32B rather than restarted at B, and the original 2048 central samples
+    are never repeated.
+    """
+    f1 = float(conv.b_tail_factor_1); f2 = float(conv.b_tail_factor_2)
+    if not (1.0 < f1 < f2):
+        raise ValueError("Require 1 < b_tail_factor_1 < b_tail_factor_2")
+    if not math.isclose(f2, f1 * f1, rel_tol=1e-12, abs_tol=0.0):
+        raise ValueError("Adaptive b_max requires b_tail_factor_2 == b_tail_factor_1**2")
+
+    metrics = (
+        ("phonon_rate_s", "phonon"),
+        ("event_rate_ge1_s", "ge1"),
+        ("event_rate_exact_M_s", "exact_M"),
+    )
+    for metric, _ in metrics:
+        if not np.isfinite(float(baseline.get(metric, np.nan))):
+            raise ValueError(f"Cannot adapt b_max without finite baseline {metric}")
+
+    # Reuse any previously enlarged central support.  A v1 row's rate already
+    # contains all promoted annuli up to adaptive_bmax_factor; do not double count.
+    previous_factor = float(baseline.get("adaptive_bmax_factor", 1.0) or 1.0)
+    previous_factor = previous_factor if np.isfinite(previous_factor) and previous_factor >= 1.0 else 1.0
+    try:
+        previous_version = int(float(baseline.get("adaptive_bmax_version", 0) or 0))
+    except Exception:
+        previous_version = 0
+    reusable_ann1, reusable_ann2 = _reusable_tail_summaries(baseline, conv)
+    # Complete v1 rows and partial v2 watchdog snapshots both contain enough
+    # information to continue from their CURRENT support.  Requiring the old
+    # audit to be complete would throw away support-repair progress after a
+    # watchdog termination.
+    reuse_previous = bool(previous_version > 0 and reusable_ann1 is not None and reusable_ann2 is not None)
+    current_rate = {metric: float(baseline[metric]) for metric, _ in metrics}
+    current_var = {
+        label: (_baseline_standard_error(baseline, label) ** 2 if np.isfinite(_baseline_standard_error(baseline, label)) else np.inf)
+        for _, label in metrics
+    }
+    support_factor = float(previous_factor if reuse_previous else 1.0)
+    expansion_count = int(float(baseline.get("adaptive_bmax_expansions", 0) or 0)) if reuse_previous else 0
+    old_tail_samples = int(float(baseline.get("adaptive_bmax_tail_samples", 0) or 0)) if reuse_previous else 0
+    total_tail_samples_new = 0
+    try:
+        history = json.loads(str(baseline.get("adaptive_bmax_history", "[]"))) if reuse_previous else []
+        if not isinstance(history, list): history = []
+    except Exception:
+        history = []
+
+    nominal_rate = {}
+    nominal_se = {}
+    for metric, label in metrics:
+        try:
+            nr = float(baseline.get(f"nominal_bmax_{metric}", np.nan))
+        except Exception:
+            nr = np.nan
+        nominal_rate[metric] = nr if np.isfinite(nr) else (current_rate[metric] if support_factor == 1.0 else np.nan)
+        try:
+            ns = float(baseline.get(f"nominal_bmax_{label}_se_s", np.nan))
+        except Exception:
+            ns = np.nan
+        nominal_se[label] = ns if np.isfinite(ns) else (_baseline_standard_error(baseline, label) if support_factor == 1.0 else np.nan)
+
+    def sample_annulus(lo_factor: float, hi_factor: float, n: int, ann_seed: int):
+        nonlocal total_tail_samples_new
+        rec = point_sample_contributions(
+            m_dm, eps, cfg, ground, int(n), seed=int(ann_seed),
+            b_annulus_factors=(lo_factor, hi_factor), progress=progress,
+        )
+        total_tail_samples_new += int(n)
+        out = {"metrics": {}, "clipped": bool(np.any(rec["b_tail_clipped"])), "n": int(n)}
+        for metric, label in metrics:
+            out["metrics"][label] = _metric_stats(rec[metric])
+        return out
+
+    ann1 = reusable_ann1 if reuse_previous else None
+    ann2 = reusable_ann2 if reuse_previous else None
+    if ann1 is None or ann2 is None:
+        ann1 = sample_annulus(support_factor, support_factor * f1, conv.b_tail_samples, seed)
+        ann2 = sample_annulus(support_factor * f1, support_factor * f2, conv.b_tail_samples, seed + 1)
+
+    final_stats = None
+    status = "support_unresolved"
+    resample_round = 0
+    max_factor = max(float(conv.adaptive_bmax_max_factor), 1.0)
+    max_expansions = max(int(conv.adaptive_bmax_max_expansions), 0)
+    max_tail_n = max(int(conv.adaptive_bmax_tail_max_samples), int(conv.b_tail_samples), 2)
+    growth = max(float(conv.adaptive_bmax_tail_sample_growth), 1.01)
+
+    def evaluate_step():
+        clipped = bool(ann1.get("clipped", False) or ann2.get("clipped", False))
+        step_stats = {
+            "support_factor": float(support_factor), "clipped": clipped,
+            "annulus_n": int(min(ann1.get("n", 0), ann2.get("n", 0))),
+            "metrics": {},
+        }
+        all_pass = not clipped; any_clear_fail = False; any_ambiguous = False
+        for metric, label in metrics:
+            s1 = ann1["metrics"][label]; s2 = ann2["metrics"][label]
+            e1 = s1["se"] if np.isfinite(s1["se"]) else np.inf
+            e2 = s2["se"] if np.isfinite(s2["se"]) else np.inf
+            m1 = max(float(s1["mean"]), 0.0); m2 = max(float(s2["mean"]), 0.0)
+            ub1 = max(0.0, m1 + conv.confidence_z * e1)
+            ub2 = max(0.0, m2 + conv.confidence_z * e2)
+            lb1 = max(0.0, m1 - conv.confidence_z * e1) if np.isfinite(e1) else 0.0
+            lb2 = max(0.0, m2 - conv.confidence_z * e2) if np.isfinite(e2) else 0.0
+            central_now = max(float(current_rate[metric]), 0.0)
+            denom = max(central_now + m1 + m2, np.finfo(float).tiny)
+            frac_mean = (m1 + m2) / denom
+            frac_upper = (ub1 + ub2) / denom
+            frac_lower = max(0.0, lb1 + lb2) / denom
+            decay_ok = ub2 <= conv.b_tail_decay_factor * max(ub1, np.finfo(float).tiny)
+            # A clear failure requires the lower confidence bound to violate
+            # either the tail-size or decay criterion. Otherwise the result is
+            # statistically ambiguous and should receive more annulus samples.
+            clear_tail_fail = frac_lower > conv.b_tail_fraction_tol
+            clear_decay_fail = lb2 > conv.b_tail_decay_factor * max(ub1, np.finfo(float).tiny)
+            passed = bool((not clipped) and np.isfinite(frac_upper) and frac_upper <= conv.b_tail_fraction_tol and decay_ok)
+            clear_fail = bool(clear_tail_fail or clear_decay_fail)
+            ambiguous = bool((not passed) and (not clear_fail) and (not clipped))
+            all_pass = all_pass and passed
+            any_clear_fail = any_clear_fail or clear_fail
+            any_ambiguous = any_ambiguous or ambiguous
+            step_stats["metrics"][label] = {
+                "ann1_mean": float(s1["mean"]), "ann1_se": float(s1["se"]), "ann1_n": int(s1["n"]),
+                "ann2_mean": float(s2["mean"]), "ann2_se": float(s2["se"]), "ann2_n": int(s2["n"]),
+                "ub1": ub1, "ub2": ub2, "lb1": lb1, "lb2": lb2,
+                "frac_mean": frac_mean, "frac_lower": frac_lower, "frac_upper": frac_upper,
+                "decay_ok": bool(decay_ok), "clear_fail": clear_fail,
+                "ambiguous": ambiguous, "pass": passed,
+            }
+        step_stats["all_pass"] = bool(all_pass)
+        step_stats["any_clear_fail"] = bool(any_clear_fail)
+        step_stats["any_ambiguous"] = bool(any_ambiguous)
+        return step_stats
+
+    def build_output(status_value: str, complete: bool, fs: dict | None):
+        out = dict(baseline)
+        out["adaptive_bmax_version"] = int(conv.adaptive_bmax_version)
+        out["adaptive_bmax_enabled"] = bool(conv.adaptive_bmax_enabled)
+        out["adaptive_bmax_complete"] = bool(complete)
+        out["adaptive_bmax_status"] = str(status_value)
+        out["adaptive_bmax_factor"] = float(support_factor)
+        out["adaptive_bmax_expansions"] = int(expansion_count)
+        out["adaptive_bmax_tail_samples"] = int(old_tail_samples + total_tail_samples_new)
+        out["adaptive_bmax_tail_samples_new"] = int(total_tail_samples_new)
+        out["adaptive_bmax_reused_previous"] = bool(reuse_previous)
+        out["adaptive_bmax_history"] = json.dumps(history, separators=(",", ":"), allow_nan=True)
+        out["b_tail_clipped"] = bool(fs["clipped"] if fs else False)
+        all_support_pass = True
+        for metric, label in metrics:
+            rate = float(current_rate[metric])
+            se = math.sqrt(current_var[label]) if np.isfinite(current_var[label]) else np.nan
+            rel = se / abs(rate) if np.isfinite(se) and rate != 0.0 else np.nan
+            out[metric] = rate
+            out[f"{label}_se_s"] = se; out[f"{label}_mc_se_s"] = se; out[f"{label}_mc_rel_se"] = rel
+            if np.isfinite(nominal_rate[metric]):
+                out[f"nominal_bmax_{metric}"] = nominal_rate[metric]
+                out[f"adaptive_bmax_added_{label}_rate_s"] = rate - nominal_rate[metric]
+                out[f"adaptive_bmax_added_{label}_fraction"] = (rate - nominal_rate[metric]) / rate if rate != 0 else np.nan
+            if np.isfinite(nominal_se[label]): out[f"nominal_bmax_{label}_se_s"] = nominal_se[label]
+            if fs:
+                mm = fs["metrics"][label]
+                out[f"b_tail1_{label}_rate_s"] = mm["ann1_mean"]
+                out[f"b_tail2_{label}_rate_s"] = mm["ann2_mean"]
+                out[f"b_tail1_{label}_se_s"] = mm["ann1_se"]
+                out[f"b_tail2_{label}_se_s"] = mm["ann2_se"]
+                out[f"b_tail1_n"] = int(mm["ann1_n"]); out[f"b_tail2_n"] = int(mm["ann2_n"])
+                out[f"b_tail_{label}_fraction_mean"] = mm["frac_mean"]
+                out[f"b_tail_{label}_fraction_lower"] = mm["frac_lower"]
+                out[f"b_tail_{label}_fraction_upper"] = mm["frac_upper"]
+                out[f"b_tail_{label}_decay_ok"] = bool(mm["decay_ok"])
+                out[f"b_tail_{label}_pass"] = bool(mm["pass"])
+                all_support_pass = all_support_pass and bool(mm["pass"])
+            else:
+                out[f"b_tail_{label}_pass"] = False; all_support_pass = False
+        out["support_converged"] = bool(all_support_pass and status_value == "converged")
+        out["support_unresolved"] = not out["support_converged"]
+        out["support_unresolved_reason"] = "" if out["support_converged"] else str(status_value)
+        out["mc_rel_se"] = out.get("phonon_mc_rel_se", np.nan)
+        out["event_mc_rel_se"] = out.get("ge1_mc_rel_se", np.nan)
+        out["event_exact_M_mc_rel_se"] = out.get("exact_M_mc_rel_se", np.nan)
+        return out
+
+    while True:
+        final_stats = evaluate_step()
+        history.append({**final_stats, "source": "v2_repair", "resample_round": int(resample_round)})
+        if progress:
+            msg = ", ".join(
+                f"{lab}: mean={100*final_stats['metrics'][lab]['frac_mean']:.1f}% "
+                f"[2sigma {100*final_stats['metrics'][lab]['frac_lower']:.1f},{100*final_stats['metrics'][lab]['frac_upper']:.1f}]%"
+                for lab in ("phonon", "ge1", "exact_M")
+            )
+            print(f"      adaptive b support={support_factor:g} B, Ntail={final_stats['annulus_n']} | {msg}", flush=True)
+
+        snapshot = build_output("in_progress", False, final_stats)
+        if checkpoint_callback is not None:
+            checkpoint_callback(snapshot)
+
+        if final_stats["all_pass"]:
+            history[-1]["decision"] = "converged"
+            status = "converged"
+            break
+        if final_stats["clipped"]:
+            history[-1]["decision"] = "geometry_limited"
+            status = "geometry_limited"
+            break
+
+        current_n = int(final_stats["annulus_n"])
+        # If the 2-sigma failure could be sampling noise, spend more samples at
+        # the SAME physical annuli before changing the support.
+        if final_stats["any_ambiguous"] and not final_stats["any_clear_fail"] and current_n < max_tail_n:
+            history[-1]["decision"] = "resample_same_annuli"
+            target_n = min(max_tail_n, max(current_n + 1, int(math.ceil(current_n * growth))))
+            extra_n = target_n - current_n
+            resample_round += 1
+            extra1 = sample_annulus(support_factor, support_factor * f1, extra_n, seed + 10000 + 20 * expansion_count + 2 * resample_round)
+            extra2 = sample_annulus(support_factor * f1, support_factor * f2, extra_n, seed + 10001 + 20 * expansion_count + 2 * resample_round)
+            for _, label in metrics:
+                ann1["metrics"][label] = _combine_metric_summaries(ann1["metrics"][label], extra1["metrics"][label])
+                ann2["metrics"][label] = _combine_metric_summaries(ann2["metrics"][label], extra2["metrics"][label])
+            ann1["n"] = target_n; ann2["n"] = target_n
+            ann1["clipped"] = bool(ann1.get("clipped", False) or extra1.get("clipped", False))
+            ann2["clipped"] = bool(ann2.get("clipped", False) or extra2.get("clipped", False))
+            continue
+
+        if final_stats["any_ambiguous"] and not final_stats["any_clear_fail"] and current_n >= max_tail_n:
+            history[-1]["decision"] = "tail_noise_limited"
+            status = "tail_noise_limited"
+            break
+
+        next_factor = support_factor * f1
+        if expansion_count >= max_expansions or next_factor > max_factor * (1.0 + 1e-12):
+            history[-1]["decision"] = "support_unresolved_max_factor"
+            status = "support_unresolved_max_factor"
+            break
+
+        history[-1]["decision"] = "expand_support"
+        # The lower confidence bound establishes that the current support is
+        # inadequate. Promote the inner tail annulus and continue outward.
+        for metric, label in metrics:
+            s1 = ann1["metrics"][label]
+            current_rate[metric] += float(s1["mean"])
+            if np.isfinite(current_var[label]) and np.isfinite(s1["se"]):
+                current_var[label] += float(s1["se"]) ** 2
+            else:
+                current_var[label] = np.inf
+        support_factor = next_factor
+        expansion_count += 1
+        resample_round = 0
+        ann1 = ann2
+        ann2 = sample_annulus(support_factor * f1, support_factor * f2, max(int(ann1.get("n", conv.b_tail_samples)), int(conv.b_tail_samples)), seed + 20000 + expansion_count)
+
+    return build_output(status, True, final_stats)
+
 def _b_tail_test(
     m_dm: float,
     eps: float,
@@ -2195,46 +2595,33 @@ def _b_tail_test(
     seed: int,
     progress: bool = False,
 ) -> dict:
-    """Estimate the omitted [B,2B] and [2B,4B] impact-parameter tails."""
-    f1 = float(conv.b_tail_factor_1)
-    f2 = float(conv.b_tail_factor_2)
-    if not (1.0 < f1 < f2):
-        raise ValueError("Require 1 < b_tail_factor_1 < b_tail_factor_2")
-    ann1 = point_sample_contributions(
-        m_dm, eps, cfg, ground, conv.b_tail_samples,
-        seed=seed, b_annulus_factors=(1.0, f1), progress=progress,
+    """Backward-compatible one-shot tail audit without central expansion."""
+    conv_one = replace(conv, adaptive_bmax_max_expansions=0)
+    upgraded = _adaptive_b_tail_test(
+        m_dm, eps, cfg, ground, conv_one, baseline, seed=seed, progress=progress
     )
-    ann2 = point_sample_contributions(
-        m_dm, eps, cfg, ground, conv.b_tail_samples,
-        seed=seed + 1, b_annulus_factors=(f1, f2), progress=progress,
-    )
-    out = {
-        "b_tail_clipped": bool(np.any(ann1["b_tail_clipped"]) or np.any(ann2["b_tail_clipped"])),
-    }
-    for metric, label in (
-        ("phonon_rate_s", "phonon"),
-        ("event_rate_ge1_s", "ge1"),
-        ("event_rate_exact_M_s", "exact_M"),
-    ):
-        s1 = _metric_stats(ann1[metric]); s2 = _metric_stats(ann2[metric])
-        ub1 = max(0.0, s1["mean"] + conv.confidence_z * (s1["se"] if np.isfinite(s1["se"]) else np.inf))
-        ub2 = max(0.0, s2["mean"] + conv.confidence_z * (s2["se"] if np.isfinite(s2["se"]) else np.inf))
-        base_rate = max(float(baseline[metric]), 0.0)
-        denom = max(base_rate + max(s1["mean"], 0.0) + max(s2["mean"], 0.0), np.finfo(float).tiny)
-        frac_upper = (ub1 + ub2) / denom
-        decay_ok = ub2 <= conv.b_tail_decay_factor * max(ub1, np.finfo(float).tiny)
-        passed = (
-            (not out["b_tail_clipped"])
-            and np.isfinite(frac_upper)
-            and frac_upper <= conv.b_tail_fraction_tol
-            and decay_ok
-        )
-        out[f"b_tail1_{label}_rate_s"] = s1["mean"]
-        out[f"b_tail2_{label}_rate_s"] = s2["mean"]
-        out[f"b_tail_{label}_fraction_upper"] = frac_upper
-        out[f"b_tail_{label}_decay_ok"] = bool(decay_ok)
-        out[f"b_tail_{label}_pass"] = bool(passed)
-    return out
+    keys = {k: v for k, v in upgraded.items() if k.startswith("b_tail_") or k == "b_tail_clipped"}
+    return keys
+
+
+def _has_complete_numerical_audit(row: dict) -> bool:
+    for name in NUMERICAL_TEST_NAMES:
+        for label in ("phonon", "ge1", "exact_M"):
+            try:
+                v = float(row.get(f"{name}_{label}_relative_upper", np.nan))
+            except (AttributeError, TypeError, ValueError):
+                return False
+            if not np.isfinite(v):
+                return False
+    return True
+
+
+def _clear_numerical_audit_fields(row: dict) -> None:
+    for name in NUMERICAL_TEST_NAMES:
+        for label in ("phonon", "ge1", "exact_M"):
+            row[f"{name}_{label}_relative_shift"] = np.nan
+            row[f"{name}_{label}_relative_upper"] = np.nan
+            row[f"{name}_{label}_pass"] = False
 
 
 def _complete_convergence_audit_from_baseline(
@@ -2247,56 +2634,119 @@ def _complete_convergence_audit_from_baseline(
     *,
     seed0: int,
     progress: bool = True,
+    checkpoint_callback=None,
 ) -> dict:
-    """Complete support/numerical audits starting from an existing central estimate.
+    """Complete adaptive support and numerical audits from an existing central estimate.
 
-    Keeping this phase separate from :func:`adaptive_point_estimate` lets the
-    subprocess worker persist the central rate before entering the expensive
-    secondary audits.  If the hard point watchdog later terminates the worker,
-    the parent can still recover and plot that central estimate instead of
-    creating a hole in the rate map.
+    Crucially, this function can consume a checkpoint central estimate computed
+    by an older notebook.  The expensive [0,B] Monte Carlo is reused exactly;
+    only missing outer annuli and, when warranted, small paired numerical
+    diagnostic samples are simulated.
     """
+    if progress:
+        print("    adaptive impact-parameter support audit", flush=True)
+    if conv.adaptive_bmax_enabled:
+        result = _adaptive_b_tail_test(
+            m_dm, eps, cfg, ground, conv, baseline, seed=seed0 + 101, progress=progress,
+            checkpoint_callback=checkpoint_callback,
+        )
+    else:
+        tail = _b_tail_test(m_dm, eps, cfg, ground, conv, baseline, seed=seed0 + 101, progress=progress)
+        result = {**baseline, **tail}
+        result["adaptive_bmax_version"] = int(conv.adaptive_bmax_version)
+        result["adaptive_bmax_enabled"] = False
+        result["adaptive_bmax_complete"] = True
+        result["adaptive_bmax_status"] = "disabled"
+        result["adaptive_bmax_factor"] = 1.0
+        result["adaptive_bmax_expansions"] = 0
+
     preliminary_mc = {
-        "phonon": bool(np.isfinite(baseline["phonon_mc_rel_se"]) and baseline["phonon_mc_rel_se"] <= conv.mc_target_rel_se),
-        "ge1": bool(np.isfinite(baseline["ge1_mc_rel_se"]) and baseline["ge1_mc_rel_se"] <= conv.mc_target_rel_se),
-        "exact_M": bool(np.isfinite(baseline["exact_M_mc_rel_se"]) and baseline["exact_M_mc_rel_se"] <= conv.mc_target_rel_se),
+        "phonon": bool(np.isfinite(result["phonon_mc_rel_se"]) and result["phonon_mc_rel_se"] <= conv.mc_target_rel_se),
+        "ge1": bool(np.isfinite(result["ge1_mc_rel_se"]) and result["ge1_mc_rel_se"] <= conv.mc_target_rel_se),
+        "exact_M": bool(np.isfinite(result["exact_M_mc_rel_se"]) and result["exact_M_mc_rel_se"] <= conv.mc_target_rel_se),
     }
     secondary_candidate = {
-        "phonon": bool(np.isfinite(baseline["phonon_mc_rel_se"]) and baseline["phonon_mc_rel_se"] <= conv.well_converged_rel_se),
-        "ge1": bool(np.isfinite(baseline["ge1_mc_rel_se"]) and baseline["ge1_mc_rel_se"] <= conv.well_converged_rel_se),
-        "exact_M": bool(np.isfinite(baseline["exact_M_mc_rel_se"]) and baseline["exact_M_mc_rel_se"] <= conv.well_converged_rel_se),
+        "phonon": bool(np.isfinite(result["phonon_mc_rel_se"]) and result["phonon_mc_rel_se"] <= conv.well_converged_rel_se),
+        "ge1": bool(np.isfinite(result["ge1_mc_rel_se"]) and result["ge1_mc_rel_se"] <= conv.well_converged_rel_se),
+        "exact_M": bool(np.isfinite(result["exact_M_mc_rel_se"]) and result["exact_M_mc_rel_se"] <= conv.well_converged_rel_se),
     }
-    if conv.skip_secondary_if_all_mc_fail and not any(secondary_candidate.values()):
+    timeout_ok = bool(float(result.get("timeout_fraction", np.inf)) <= conv.max_timeout_fraction)
+    support_factor = float(result.get("adaptive_bmax_factor", 1.0))
+    support_all_pass = all(bool(result.get(f"b_tail_{lab}_pass", False)) for lab in ("phonon", "ge1", "exact_M"))
+    try:
+        baseline_numeric_factor = float(baseline.get("numerical_audit_b_support_factor", np.nan))
+    except Exception:
+        baseline_numeric_factor = np.nan
+    can_reuse_numeric = bool(
+        support_all_pass
+        and np.isfinite(baseline_numeric_factor)
+        and math.isclose(support_factor, baseline_numeric_factor, rel_tol=1e-12, abs_tol=1e-15)
+        and _has_complete_numerical_audit(baseline)
+        and not _safe_bool(baseline.get("secondary_audit_skipped", False), False)
+    )
+
+    # Numerical convergence on an integration domain whose b support is still
+    # open is not useful.  Preserve/return the central estimate and explicitly
+    # mark the numerical audit as blocked by support.
+    if not support_all_pass:
         if progress:
-            print(
-                "    secondary audits skipped: all observables exceed the well-converged MC threshold",
-                flush=True,
-            )
-        result = dict(baseline)
+            print("    paired numerical audits blocked: adaptive b support is not converged", flush=True)
+        _clear_numerical_audit_fields(result)
         result["secondary_audit_skipped"] = True
-        result["timeout_pass"] = bool(baseline["timeout_fraction"] <= conv.max_timeout_fraction)
+        result["numerical_audit_skipped"] = True
+        result["numerical_audit_skip_reason"] = "support_not_converged"
+        result["numerical_audit_reused"] = False
+        result["numerical_audit_b_support_factor"] = np.nan
+        result["timeout_pass"] = timeout_ok
         for label in ("phonon", "ge1", "exact_M"):
             result[f"mc_{label}_pass"] = preliminary_mc[label]
-            result[f"b_tail_{label}_pass"] = False
             result[f"numerical_{label}_pass"] = False
             result[f"reliable_{label}"] = False
-            result[f"b_tail_{label}_fraction_upper"] = np.nan
-        result["b_tail_clipped"] = False
         result["reliable_all"] = False
-        failed = [f"MC:{label}" for label, passed in preliminary_mc.items() if not passed]
-        if not result["timeout_pass"]:
-            failed.insert(0, "timeouts")
+        failed=[]
+        if not timeout_ok: failed.append("timeouts")
+        for label in ("phonon", "ge1", "exact_M"):
+            if not preliminary_mc[label]: failed.append(f"MC:{label}")
+            if not bool(result.get(f"b_tail_{label}_pass", False)): failed.append(f"b-tail:{label}")
         result["reliability_failures"] = ";".join(failed)
         return result
 
-    if progress:
-        print("    impact-parameter tail audit", flush=True)
-    tail = _b_tail_test(m_dm, eps, cfg, ground, conv, baseline, seed=seed0 + 101, progress=progress)
+    if conv.skip_secondary_if_all_mc_fail and not any(secondary_candidate.values()):
+        if progress:
+            print(
+                "    paired numerical audits skipped: all observables exceed the well-converged MC threshold",
+                flush=True,
+            )
+        # If the support was enlarged, any legacy numerical audit referred to
+        # the wrong b-domain and must not be plotted as current.  If support
+        # stayed at B, retain an existing complete numerical audit as useful
+        # provenance even though it is not needed for classification.
+        if not can_reuse_numeric:
+            _clear_numerical_audit_fields(result)
+        result["secondary_audit_skipped"] = True
+        result["numerical_audit_skipped"] = True
+        result["numerical_audit_reused"] = bool(can_reuse_numeric)
+        result["numerical_audit_b_support_factor"] = support_factor if can_reuse_numeric else np.nan
+        result["timeout_pass"] = timeout_ok
+        for label in ("phonon", "ge1", "exact_M"):
+            result[f"mc_{label}_pass"] = preliminary_mc[label]
+            result[f"numerical_{label}_pass"] = bool(
+                can_reuse_numeric and all(
+                    float(result[f"{name}_{label}_relative_upper"]) <= conv.numerical_rel_tol
+                    for name in NUMERICAL_TEST_NAMES
+                )
+            )
+            result[f"reliable_{label}"] = False
+        result["reliable_all"] = False
+        failed = []
+        if not timeout_ok:
+            failed.append("timeouts")
+        for label in ("phonon", "ge1", "exact_M"):
+            if not preliminary_mc[label]: failed.append(f"MC:{label}")
+            if not bool(result.get(f"b_tail_{label}_pass", False)): failed.append(f"b-tail:{label}")
+        result["reliability_failures"] = ";".join(failed)
+        return result
 
-    if progress:
-        print("    paired numerical convergence audit", flush=True)
-    n_diag = max(int(conv.diagnostic_samples), 2)
-    diag_base = point_sample_contributions(m_dm, eps, cfg, ground, n_diag, seed=seed0 + 202)
     variants = {
         "far_outer": replace(
             cfg,
@@ -2319,26 +2769,51 @@ def _complete_convergence_audit_from_baseline(
             max_ground_interactions=cfg.max_ground_interactions + int(conv.extra_ground_interactions),
         ),
     }
-    numeric = {}
-    for name, cfg_var in variants.items():
-        if progress:
-            print(f"      {name}", flush=True)
-        var = point_sample_contributions(m_dm, eps, cfg_var, ground, n_diag, seed=seed0 + 202)
-        for metric, label in (
-            ("phonon_rate_s", "phonon"),
-            ("event_rate_ge1_s", "ge1"),
-            ("event_rate_exact_M_s", "exact_M"),
-        ):
-            test = _paired_convergence_metric(diag_base[metric], var[metric], conv.confidence_z)
-            numeric[f"{name}_{label}_relative_shift"] = test["relative_shift"]
-            numeric[f"{name}_{label}_relative_upper"] = test["relative_upper"]
-            numeric[f"{name}_{label}_pass"] = bool(
-                np.isfinite(test["relative_upper"])
-                and test["relative_upper"] <= conv.numerical_rel_tol
-            )
 
-    timeout_ok = bool(baseline["timeout_fraction"] <= conv.max_timeout_fraction)
-    result = {**baseline, **tail, **numeric, "timeout_pass": timeout_ok, "secondary_audit_skipped": False}
+    if can_reuse_numeric:
+        if progress:
+            print("    reusing existing paired numerical audit at nominal b support", flush=True)
+        numeric = {}
+        for name in NUMERICAL_TEST_NAMES:
+            for label in ("phonon", "ge1", "exact_M"):
+                for suffix in ("relative_shift", "relative_upper", "pass"):
+                    key = f"{name}_{label}_{suffix}"
+                    numeric[key] = baseline.get(key, np.nan if suffix != "pass" else False)
+        result["numerical_audit_reused"] = True
+    else:
+        if progress:
+            print(f"    paired numerical convergence audit at b support={support_factor:g} B", flush=True)
+        n_diag = max(int(conv.diagnostic_samples), 2)
+        diag_base = point_sample_contributions(
+            m_dm, eps, cfg, ground, n_diag, seed=seed0 + 202, b_support_factor=support_factor
+        )
+        numeric = {}
+        for name, cfg_var in variants.items():
+            if progress:
+                print(f"      {name}", flush=True)
+            var = point_sample_contributions(
+                m_dm, eps, cfg_var, ground, n_diag, seed=seed0 + 202,
+                b_support_factor=support_factor,
+            )
+            for metric, label in (
+                ("phonon_rate_s", "phonon"),
+                ("event_rate_ge1_s", "ge1"),
+                ("event_rate_exact_M_s", "exact_M"),
+            ):
+                test = _paired_convergence_metric(diag_base[metric], var[metric], conv.confidence_z)
+                numeric[f"{name}_{label}_relative_shift"] = test["relative_shift"]
+                numeric[f"{name}_{label}_relative_upper"] = test["relative_upper"]
+                numeric[f"{name}_{label}_pass"] = bool(
+                    np.isfinite(test["relative_upper"])
+                    and test["relative_upper"] <= conv.numerical_rel_tol
+                )
+        result["numerical_audit_reused"] = False
+
+    result.update(numeric)
+    result["timeout_pass"] = timeout_ok
+    result["secondary_audit_skipped"] = False
+    result["numerical_audit_skipped"] = False
+    result["numerical_audit_b_support_factor"] = support_factor
     for label, rel_key in (
         ("phonon", "phonon_mc_rel_se"),
         ("ge1", "ge1_mc_rel_se"),
@@ -2358,14 +2833,40 @@ def _complete_convergence_audit_from_baseline(
     if not timeout_ok:
         failed.append("timeouts")
     for label in ("phonon", "ge1", "exact_M"):
-        if not result[f"mc_{label}_pass"]:
-            failed.append(f"MC:{label}")
-        if not result[f"b_tail_{label}_pass"]:
-            failed.append(f"b-tail:{label}")
-        if not result[f"numerical_{label}_pass"]:
-            failed.append(f"numerical:{label}")
+        if not result[f"mc_{label}_pass"]: failed.append(f"MC:{label}")
+        if not result[f"b_tail_{label}_pass"]: failed.append(f"b-tail:{label}")
+        if not result[f"numerical_{label}_pass"]: failed.append(f"numerical:{label}")
     result["reliability_failures"] = ";".join(failed)
     return result
+
+
+def upgrade_existing_audit_point(
+    m_dm: float,
+    eps: float,
+    cfg: ScanConfig,
+    ground: CopperGroundPlane,
+    conv: ConvergenceConfig,
+    baseline: dict,
+    *,
+    seed: int | None = None,
+    progress: bool = True,
+    checkpoint_callback=None,
+) -> dict:
+    """Upgrade a legacy finite checkpoint row without rerunning its central MC."""
+    if not _has_finite_central_estimate(baseline):
+        raise ValueError("upgrade_existing_audit_point requires a finite central checkpoint result")
+    seed0 = cfg.seed if seed is None else int(seed)
+    # Strip fatal flags caused only by an older secondary-audit timeout.  The
+    # central estimate itself is being intentionally reused and the new worker
+    # receives a fresh watchdog budget for the adaptive support audit.
+    base = dict(baseline)
+    base["wallclock_timeout"] = False
+    base["worker_failure"] = False
+    base["central_estimate_reused"] = True
+    return _complete_convergence_audit_from_baseline(
+        m_dm, eps, cfg, ground, conv, base, seed0=seed0, progress=progress,
+        checkpoint_callback=checkpoint_callback,
+    )
 
 
 def convergence_audit_point(
@@ -2393,9 +2894,24 @@ def convergence_audit_point(
 RESULT_CLASS_LABELS = {
     0: "unresolved",
     1: "noisy",
-    2: "estimated",
-    3: "well_converged",
-    4: "precision_certified",
+    2: "support_unresolved",
+    3: "estimated",
+    4: "well_converged",
+    5: "precision_certified",
+}
+
+NUMERICAL_TEST_NAMES = ("far_outer", "timestep", "tolerances", "stage_time", "switch", "ground")
+NUMERICAL_FAILURE_LABELS = {
+    0: "not_audited_mc",
+    1: "pass_all",
+    2: "far_outer",
+    3: "timestep",
+    4: "tolerances",
+    5: "stage_time",
+    6: "switch",
+    7: "ground",
+    8: "timeout_or_failure",
+    9: "blocked_by_support",
 }
 
 
@@ -2423,33 +2939,15 @@ def _safe_bool(value, default: bool = False) -> bool:
 
 
 def classify_audit_observable(row: dict | pd.Series, label: str, conv: ConvergenceConfig) -> dict:
-    """Classify one observable without discarding its central estimate.
+    """Classify one observable while keeping support uncertainty explicit.
 
-    Classes are ordered from weakest to strongest:
-
-      0 unresolved
-          worker/point timeout, excessive trajectory timeout fraction,
-          non-finite estimate/error, or MC relative SE > noisy_rel_se.
-      1 noisy
-          finite estimate with noisy_rel_se >= rel.SE > estimated_rel_se.
-      2 estimated
-          finite estimate with rel.SE <= estimated_rel_se, but the complete
-          support/numerical certification is absent or failed.
-      3 well_converged
-          rel.SE <= well_converged_rel_se and all b-tail, numerical, and
-          timeout audits pass.
-      4 precision_certified
-          rel.SE <= mc_target_rel_se and the same audits pass.
-
-    Thus the classification communicates useful precision without weakening
-    the original strict ``reliable_*`` definition.
+    A finite 10--20% MC estimate is no longer called ``estimated`` when the
+    adaptive impact-parameter support is still open.  Such a point receives the
+    separate ``support_unresolved`` class.  This prevents a small sampling SE
+    from hiding a potentially biased truncation in b.
     """
     label = str(label)
     mapping = {
-        # The audit engine historically wrote ``*_se_s``.  Version 2026-08-12.2
-        # accidentally made the classifier look only for ``*_mc_se_s``; that
-        # made every otherwise finite row appear unresolved.  Accept both
-        # spellings so old checkpoints can be reclassified without rerunning.
         "phonon": ("phonon_rate_s", ("phonon_mc_se_s", "phonon_se_s"), "phonon_mc_rel_se"),
         "ge1": ("event_rate_ge1_s", ("ge1_mc_se_s", "ge1_se_s"), "ge1_mc_rel_se"),
         "exact_M": ("event_rate_exact_M_s", ("exact_M_mc_se_s", "exact_M_se_s"), "exact_M_mc_rel_se"),
@@ -2457,98 +2955,100 @@ def classify_audit_observable(row: dict | pd.Series, label: str, conv: Convergen
     if label not in mapping:
         raise ValueError(f"Unknown observable label {label!r}")
     rate_key, se_keys, rel_key = mapping[label]
-
     def get(key, default=np.nan):
-        try:
-            return row.get(key, default)
-        except AttributeError:
-            return default
-
+        try: return row.get(key, default)
+        except AttributeError: return default
     def first_finite(keys):
         for key in keys:
-            try:
-                value = float(get(key, np.nan))
-            except (TypeError, ValueError):
-                value = np.nan
-            if np.isfinite(value):
-                return value
+            try: value = float(get(key, np.nan))
+            except Exception: value = np.nan
+            if np.isfinite(value): return value
         return np.nan
-
-    rate = float(get(rate_key, np.nan))
+    try: rate = float(get(rate_key, np.nan))
+    except Exception: rate = np.nan
     se = first_finite(se_keys)
-    rel = float(get(rel_key, np.nan))
-    # Backward-compatible reconstruction for checkpoints that stored only the
-    # relative error or only the absolute error.
-    if not np.isfinite(se) and np.isfinite(rate) and np.isfinite(rel):
-        se = abs(rate) * rel
-    if not np.isfinite(rel) and np.isfinite(rate) and rate != 0.0 and np.isfinite(se):
-        rel = se / abs(rate)
-    wallclock_timeout = _safe_bool(get("wallclock_timeout", False), False)
+    try: rel = float(get(rel_key, np.nan))
+    except Exception: rel = np.nan
+    if not np.isfinite(se) and np.isfinite(rate) and np.isfinite(rel): se = abs(rate) * rel
+    if not np.isfinite(rel) and np.isfinite(rate) and rate != 0.0 and np.isfinite(se): rel = se / abs(rate)
+
     worker_failure = _safe_bool(get("worker_failure", False), False)
-    timeout_fraction = float(get("timeout_fraction", np.nan))
-    timeout_pass = _safe_bool(get("timeout_pass", np.isfinite(timeout_fraction) and timeout_fraction <= conv.max_timeout_fraction), np.isfinite(timeout_fraction) and timeout_fraction <= conv.max_timeout_fraction)
-
-    fatal_reason = None
+    wallclock_timeout = _safe_bool(get("wallclock_timeout", False), False)
+    try: timeout_fraction = float(get("timeout_fraction", np.nan))
+    except Exception: timeout_fraction = np.nan
+    timeout_pass = _safe_bool(
+        get("timeout_pass", np.isfinite(timeout_fraction) and timeout_fraction <= conv.max_timeout_fraction),
+        np.isfinite(timeout_fraction) and timeout_fraction <= conv.max_timeout_fraction,
+    )
     if worker_failure:
-        fatal_reason = "worker failure"
-    elif wallclock_timeout:
-        fatal_reason = "parameter-point wall-clock timeout"
-    elif not np.isfinite(rate) or not np.isfinite(se) or not np.isfinite(rel):
-        fatal_reason = "non-finite central estimate or Monte Carlo error"
-    elif not timeout_pass or (np.isfinite(timeout_fraction) and timeout_fraction > conv.max_timeout_fraction):
-        fatal_reason = "trajectory timeout fraction exceeds allowed limit"
-    elif rel > conv.noisy_rel_se:
-        fatal_reason = f"MC relative SE exceeds {100*conv.noisy_rel_se:.0f}%"
+        return {"code": 0, "classification": RESULT_CLASS_LABELS[0], "reason": "worker failure"}
+    if not np.isfinite(rate) or not np.isfinite(se) or not np.isfinite(rel):
+        return {"code": 0, "classification": RESULT_CLASS_LABELS[0], "reason": "non-finite central estimate or Monte Carlo error"}
+    if not timeout_pass or (np.isfinite(timeout_fraction) and timeout_fraction > conv.max_timeout_fraction):
+        return {"code": 0, "classification": RESULT_CLASS_LABELS[0], "reason": "trajectory timeout fraction exceeds allowed limit"}
+    if rel > conv.noisy_rel_se:
+        return {"code": 0, "classification": RESULT_CLASS_LABELS[0], "reason": f"MC relative SE exceeds {100*conv.noisy_rel_se:.0f}%"}
 
-    if fatal_reason is not None:
-        return {"code": 0, "classification": RESULT_CLASS_LABELS[0], "reason": fatal_reason}
-
+    support_pass = _safe_bool(get(f"b_tail_{label}_pass", False), False)
+    support_complete = _safe_bool(get("adaptive_bmax_complete", False), False)
+    support_status = str(get("adaptive_bmax_status", "not_audited"))
+    # A point-level watchdog after a finite central estimate is not allowed to
+    # masquerade as precision convergence, but it can remain a finite estimate.
     secondary_skipped = _safe_bool(get("secondary_audit_skipped", True), True)
-    b_pass = _safe_bool(get(f"b_tail_{label}_pass", False), False)
     numerical_pass = _safe_bool(get(f"numerical_{label}_pass", False), False)
-    full_audit_pass = (not secondary_skipped) and b_pass and numerical_pass and timeout_pass
+    full_audit_pass = support_complete and support_pass and (not secondary_skipped) and numerical_pass and timeout_pass and (not wallclock_timeout)
 
     if full_audit_pass and rel <= conv.precision_rel_se:
-        code = 4
-        reason = (
-            f"MC rel.SE <= {100*conv.precision_rel_se:.0f}% and b-tail, numerical, "
-            "and timeout audits all pass"
-        )
-    elif full_audit_pass and rel <= conv.well_converged_rel_se:
-        code = 3
-        reason = (
-            f"MC rel.SE <= {100*conv.well_converged_rel_se:.0f}% and b-tail, numerical, "
-            "and timeout audits all pass"
-        )
-    elif rel <= conv.estimated_rel_se:
-        code = 2
-        if secondary_skipped:
-            reason = (
-                f"MC rel.SE <= {100*conv.estimated_rel_se:.0f}%; secondary convergence audit not run"
-            )
-        elif not (b_pass and numerical_pass):
-            failed = []
-            if not b_pass:
-                failed.append("b-tail")
-            if not numerical_pass:
-                failed.append("numerical")
-            reason = (
-                f"MC rel.SE <= {100*conv.estimated_rel_se:.0f}%, but " + ", ".join(failed) + " audit failed"
-            )
-        else:
-            reason = f"MC rel.SE <= {100*conv.estimated_rel_se:.0f}%"
-    elif rel <= conv.noisy_rel_se:
-        code = 1
-        reason = (
-            f"finite estimate but MC relative SE is between "
-            f"{100*conv.estimated_rel_se:.0f}% and {100*conv.noisy_rel_se:.0f}%"
-        )
-    else:
-        code = 0
-        reason = f"MC relative SE exceeds {100*conv.noisy_rel_se:.0f}%"
+        return {"code": 5, "classification": RESULT_CLASS_LABELS[5], "reason": f"MC rel.SE <= {100*conv.precision_rel_se:.0f}% and support, numerical, and timeout audits all pass"}
+    if full_audit_pass and rel <= conv.well_converged_rel_se:
+        return {"code": 4, "classification": RESULT_CLASS_LABELS[4], "reason": f"MC rel.SE <= {100*conv.well_converged_rel_se:.0f}% and support, numerical, and timeout audits all pass"}
 
-    return {"code": code, "classification": RESULT_CLASS_LABELS[code], "reason": reason}
+    # Support failure outranks the ordinary statistical classes: a finite rate
+    # exists, but its b-domain may still omit physical contribution.
+    if support_complete and not support_pass:
+        return {"code": 2, "classification": RESULT_CLASS_LABELS[2], "reason": f"finite central estimate, but adaptive b support is unresolved ({support_status})"}
 
+    if rel <= conv.estimated_rel_se:
+        extra = "; numerical audit incomplete" if (secondary_skipped or wallclock_timeout) else ""
+        return {"code": 3, "classification": RESULT_CLASS_LABELS[3], "reason": f"MC rel.SE <= {100*conv.estimated_rel_se:.0f}% with bounded b support{extra}"}
+    if rel <= conv.noisy_rel_se:
+        return {"code": 1, "classification": RESULT_CLASS_LABELS[1], "reason": f"finite estimate with bounded b support but MC relative SE is {100*rel:.1f}%"}
+    return {"code": 0, "classification": RESULT_CLASS_LABELS[0], "reason": "unresolved"}
+
+def add_numerical_failure_diagnostics(df: pd.DataFrame, conv: ConvergenceConfig) -> pd.DataFrame:
+    """Identify the limiting numerical test, or why no numerical audit exists."""
+    out = df.copy()
+    name_to_code = {name: i + 2 for i, name in enumerate(NUMERICAL_TEST_NAMES)}
+    for label in ("phonon", "ge1", "exact_M"):
+        max_vals=[]; dom_names=[]; dom_codes=[]; dom_pass=[]
+        for _, row in out.iterrows():
+            if _safe_bool(row.get("worker_failure", False), False):
+                max_vals.append(np.nan); dom_names.append("timeout_or_failure"); dom_codes.append(8); dom_pass.append(False); continue
+            vals=[]
+            for name in NUMERICAL_TEST_NAMES:
+                try: v=float(row.get(f"{name}_{label}_relative_upper", np.nan))
+                except Exception: v=np.nan
+                if np.isfinite(v): vals.append((name,v))
+            if not vals:
+                if _safe_bool(row.get("adaptive_bmax_complete", False), False) and not _safe_bool(row.get(f"b_tail_{label}_pass", False), False):
+                    dom="blocked_by_support"; code=9
+                elif _safe_bool(row.get("wallclock_timeout", False), False):
+                    dom="timeout_or_failure"; code=8
+                else:
+                    dom="not_audited_mc"; code=0
+                max_vals.append(np.nan); dom_names.append(dom); dom_codes.append(code); dom_pass.append(False); continue
+            name,vmax=max(vals,key=lambda x:x[1])
+            all_pass=len(vals)==len(NUMERICAL_TEST_NAMES) and all(v<=conv.numerical_rel_tol for _,v in vals)
+            max_vals.append(float(vmax))
+            if all_pass:
+                dom_names.append("pass_all"); dom_codes.append(1); dom_pass.append(True)
+            else:
+                dom_names.append(name); dom_codes.append(name_to_code[name]); dom_pass.append(False)
+        out[f"max_numerical_{label}_relative_upper"]=max_vals
+        out[f"dominant_numerical_{label}"]=dom_names
+        out[f"dominant_numerical_{label}_code"]=dom_codes
+        out[f"dominant_numerical_{label}_pass"]=dom_pass
+    return out
 
 def add_result_classifications(df: pd.DataFrame, conv: ConvergenceConfig) -> pd.DataFrame:
     """Return a copy of an audit table with per-observable quality classes.
@@ -2567,9 +3067,10 @@ def add_result_classifications(df: pd.DataFrame, conv: ConvergenceConfig) -> pd.
         rel_values = pd.to_numeric(out.get(rel_key, np.nan), errors="coerce")
         out[f"{label}_mc_error_pct"] = 100.0 * rel_values
         skipped = out.get("secondary_audit_skipped", pd.Series(True, index=out.index)).fillna(True).astype(bool)
+        support_ok = out.get(f"b_tail_{label}_pass", pd.Series(False, index=out.index)).fillna(False).astype(bool)
         out[f"{label}_needs_secondary_audit"] = (
-            skipped & np.isfinite(rel_values) & (rel_values <= conv.well_converged_rel_se)
-            & (out[f"{label}_class_code"] < 3)
+            skipped & support_ok & np.isfinite(rel_values) & (rel_values <= conv.well_converged_rel_se)
+            & (out[f"{label}_class_code"] < 4)
         )
     if len(out):
         class_cols = [f"{label}_class_code" for label in ("phonon", "ge1", "exact_M")]
@@ -2681,6 +3182,40 @@ def _has_finite_central_estimate(row) -> bool:
         return False
 
 
+def _has_current_adaptive_bmax_audit(row, conv: ConvergenceConfig) -> bool:
+    try:
+        version = int(float(row.get("adaptive_bmax_version", 0) or 0))
+    except Exception:
+        version = 0
+    complete = _safe_bool(row.get("adaptive_bmax_complete", False), False) if hasattr(row, "get") else False
+    return bool(version == int(conv.adaptive_bmax_version) and complete)
+
+
+def _can_metadata_migrate_support(row, conv: ConvergenceConfig) -> bool:
+    """Old converged support audits remain valid without new trajectories."""
+    if not hasattr(row, "get") or not _has_finite_central_estimate(row):
+        return False
+    try: old_version = int(float(row.get("adaptive_bmax_version", 0) or 0))
+    except Exception: old_version = 0
+    if old_version <= 0 or old_version >= int(conv.adaptive_bmax_version):
+        return False
+    if not _safe_bool(row.get("adaptive_bmax_complete", False), False):
+        return False
+    if str(row.get("adaptive_bmax_status", "")) != "converged":
+        return False
+    return all(_safe_bool(row.get(f"b_tail_{lab}_pass", False), False) for lab in ("phonon","ge1","exact_M"))
+
+
+def _metadata_migrate_support(row: dict, conv: ConvergenceConfig) -> dict:
+    out = dict(row)
+    out["adaptive_bmax_version"] = int(conv.adaptive_bmax_version)
+    out["adaptive_bmax_reused_previous"] = True
+    out["support_converged"] = True
+    out["support_unresolved"] = False
+    out["support_unresolved_reason"] = ""
+    out["support_migration_only"] = True
+    return out
+
 def _checkpoint_row_score(row, order: int) -> tuple:
     """Rank duplicate checkpoint rows, preferring useful/newer evaluations."""
     finite_rates = sum(
@@ -2763,13 +3298,7 @@ def _incomplete_audit_from_baseline(
 
 
 def _run_worker_job(job_path: str | Path) -> int:
-    """Standalone worker entry point used by the robust subprocess backend.
-
-    The worker writes a *partial* result immediately after the central Monte
-    Carlo estimate finishes.  A hard parent-process watchdog can therefore
-    recover the actual rate even if a later b-tail/numerical audit is too
-    expensive.
-    """
+    """Standalone worker entry point for central runs and checkpoint upgrades."""
     job_path = Path(job_path)
     job = json.loads(job_path.read_text())
     result_path = Path(job["result_path"])
@@ -2780,6 +3309,7 @@ def _run_worker_job(job_path: str | Path) -> int:
     total = int(job["total"])
     m_dm = float(job["m_dm"])
     eps = float(job["eps"])
+    job_mode = str(job.get("job_mode", "central"))
     t0 = time.perf_counter()
 
     def write_payload(payload: dict) -> None:
@@ -2788,7 +3318,7 @@ def _run_worker_job(job_path: str | Path) -> int:
         os.replace(tmp, result_path)
 
     print(
-        f"[worker {os.getpid()}] point {ordinal}/{total}: m={m_dm:.6e}, eps={eps:.6e}",
+        f"[worker {os.getpid()}] {job_mode} point {ordinal}/{total}: m={m_dm:.6e}, eps={eps:.6e}",
         flush=True,
     )
     baseline = None
@@ -2796,44 +3326,73 @@ def _run_worker_job(job_path: str | Path) -> int:
         if not mathieu_metrics(m_dm, eps, cfg)["pseudopotential_valid"]:
             raise ValueError("Refusing to audit a pseudopotential-invalid point")
         seed0 = cfg.seed
-        print("    central adaptive estimate", flush=True)
-        baseline = adaptive_point_estimate(
-            m_dm, eps, cfg, ground, conv, seed=seed0, progress=True
-        )
-        partial = dict(baseline)
-        partial["worker_elapsed_s"] = float(time.perf_counter() - t0)
-        partial["worker_pid"] = int(os.getpid())
-        partial["wallclock_timeout"] = False
-        partial["worker_failure"] = False
-        partial["module_version"] = MODULE_VERSION
-        partial["point_ordinal"] = ordinal
-        partial = _incomplete_audit_from_baseline(
-            partial, "secondary-audit-not-yet-complete", wallclock_timeout=False, worker_failure=False
-        )
-        write_payload({"ok": False, "partial": True, "phase": "central_complete", "result": partial})
+        if job_mode == "support_upgrade":
+            baseline = dict(job["baseline"])
+            print("    reusing checkpoint central estimate; no central MC rerun", flush=True)
+            partial = _incomplete_audit_from_baseline(
+                baseline, "adaptive-bmax-upgrade-not-yet-complete", wallclock_timeout=False, worker_failure=False
+            )
+            partial["central_estimate_reused"] = True
+            partial["worker_elapsed_s"] = float(time.perf_counter() - t0)
+            partial["worker_pid"] = int(os.getpid())
+            partial["module_version"] = MODULE_VERSION
+            partial["point_ordinal"] = ordinal
+            write_payload({"ok": False, "partial": True, "phase": "central_reused", "result": partial})
+            def support_checkpoint(snapshot):
+                snap = dict(snapshot)
+                snap["central_estimate_reused"] = True
+                snap["worker_elapsed_s"] = float(time.perf_counter() - t0)
+                snap["worker_pid"] = int(os.getpid())
+                snap["module_version"] = MODULE_VERSION
+                snap["point_ordinal"] = ordinal
+                snap["job_mode"] = job_mode
+                write_payload({"ok": False, "partial": True, "phase": "support_progress", "result": snap})
+            audited = upgrade_existing_audit_point(
+                m_dm, eps, cfg, ground, conv, baseline, seed=seed0, progress=True,
+                checkpoint_callback=support_checkpoint,
+            )
+        else:
+            print("    central adaptive estimate", flush=True)
+            baseline = adaptive_point_estimate(
+                m_dm, eps, cfg, ground, conv, seed=seed0, progress=True
+            )
+            partial = dict(baseline)
+            partial["worker_elapsed_s"] = float(time.perf_counter() - t0)
+            partial["worker_pid"] = int(os.getpid())
+            partial["wallclock_timeout"] = False
+            partial["worker_failure"] = False
+            partial["module_version"] = MODULE_VERSION
+            partial["point_ordinal"] = ordinal
+            partial = _incomplete_audit_from_baseline(
+                partial, "secondary-audit-not-yet-complete", wallclock_timeout=False, worker_failure=False
+            )
+            write_payload({"ok": False, "partial": True, "phase": "central_complete", "result": partial})
+            audited = _complete_convergence_audit_from_baseline(
+                m_dm, eps, cfg, ground, conv, baseline, seed0=seed0, progress=True
+            )
 
-        audited = _complete_convergence_audit_from_baseline(
-            m_dm, eps, cfg, ground, conv, baseline, seed0=seed0, progress=True
-        )
         audited["worker_elapsed_s"] = float(time.perf_counter() - t0)
         audited["worker_pid"] = int(os.getpid())
         audited["wallclock_timeout"] = False
         audited["worker_failure"] = False
         audited["module_version"] = MODULE_VERSION
         audited["point_ordinal"] = ordinal
+        audited["job_mode"] = job_mode
         write_payload({"ok": True, "phase": "complete", "result": audited})
         return 0
     except Exception as exc:
         traceback.print_exc()
-        if baseline is not None:
+        if baseline is not None and _has_finite_central_estimate(baseline):
             partial = _incomplete_audit_from_baseline(
                 baseline, f"worker-exception-after-central:{type(exc).__name__}: {exc}",
                 worker_failure=True,
             )
+            partial["central_estimate_reused"] = bool(job_mode == "support_upgrade")
             partial["worker_elapsed_s"] = float(time.perf_counter() - t0)
             partial["worker_pid"] = int(os.getpid())
             partial["module_version"] = MODULE_VERSION
             partial["point_ordinal"] = ordinal
+            partial["job_mode"] = job_mode
             payload = {
                 "ok": False, "partial": True, "phase": "secondary_failed",
                 "result": partial, "error": f"{type(exc).__name__}: {exc}",
@@ -2865,32 +3424,23 @@ def run_converged_valid_grid(
     heartbeat_s: float = 30.0,
     poll_s: float = 1.0,
 ) -> pd.DataFrame:
-    """Audit only pseudopotential-valid points with checkpointing and watchdogs.
+    """Audit all pseudopotential-valid points with incremental checkpoint reuse.
 
-    ``max_workers`` is the number of parameter points evaluated concurrently.
-    For ``max_workers > 1`` the default ``parallel_backend='subprocess'`` uses
-    independent Python worker processes rather than Python threads.  This is
-    intentional: the staged RHS contains Python work, so processes avoid the
-    GIL, and a pathological solve_ivp call can be terminated without freezing
-    the notebook.
+    Version 2026-08-13.2 reuses prior central/support work and distinguishes pending work:
 
-    The subprocess backend has two independent anti-hang layers:
-      * ``cfg.ode_segment_walltime_s`` aborts one solve_ivp segment from inside
-        its RHS if that individual segment exceeds its wall-clock budget;
-      * ``point_timeout_s`` is a hard external watchdog for the complete
-        parameter-point audit. A timed-out point is checkpointed as unreliable
-        and the remaining grid continues.
+    * ``central``: no finite central result exists, so the full adaptive central
+      Monte Carlo must be run;
+    * ``support_upgrade``: a finite legacy central result already exists.  The
+      expensive [0,B] sample is reused and only the adaptive outer-b annuli plus
+      any required paired numerical diagnostics are run.
 
-    ``parallel_backend='thread'`` is retained only for compatibility. Threads
-    cannot reliably kill a stuck solve_ivp call and usually scale less well for
-    this CPU-bound workload.
+    Therefore enabling adaptive b_max does *not* throw away previous results.
     """
     ground = ground or CopperGroundPlane()
     conv = conv or ConvergenceConfig()
     valid = valid_parameter_points(cfg)
     checkpoint = Path(checkpoint_path) if checkpoint_path is not None else None
     rows: list[dict] = []
-    completed = set()
     resume_diag = {
         "checkpoint_rows": 0, "current_valid_points": len(valid),
         "matched_unique_points": 0, "finite_central_points": 0,
@@ -2901,13 +3451,6 @@ def run_converged_valid_grid(
             old = pd.read_csv(checkpoint)
             if {"m_dm_kg", "eps"}.issubset(old.columns):
                 rows, resume_diag = _canonicalize_checkpoint(old, valid)
-                # A checkpoint row counts as complete for resume only when an
-                # actual finite central estimate exists.  Old timeout/failure
-                # placeholders with NaN rates are automatically resubmitted.
-                completed = {
-                    _row_point_key(r) for r in rows if _has_finite_central_estimate(r)
-                }
-                completed.discard(None)
                 if progress:
                     print(f"Checkpoint: {checkpoint}", flush=True)
                     print(
@@ -2924,32 +3467,56 @@ def run_converged_valid_grid(
                     )
         except Exception as exc:
             warnings.warn(f"Could not resume checkpoint {checkpoint}: {exc}")
-            rows = []; completed = set()
+            rows = []
 
+    by_key = {_row_point_key(r): dict(r) for r in rows if _row_point_key(r) is not None}
     total = len(valid)
     pending = []
+    n_central = 0
+    n_upgrade = 0
+    n_migrated = 0
     for ordinal, rec in enumerate(valid.to_dict("records"), 1):
         m_dm = float(rec["m_dm_kg"]); eps = float(rec["eps"])
         key = _row_point_key(rec)
-        if key not in completed:
-            pending.append((ordinal, m_dm, eps, key))
+        existing = by_key.get(key)
+        if existing is None or not _has_finite_central_estimate(existing):
+            pending.append((ordinal, m_dm, eps, key, "central", None))
+            n_central += 1
+        elif conv.adaptive_bmax_enabled and not _has_current_adaptive_bmax_audit(existing, conv):
+            if _can_metadata_migrate_support(existing, conv):
+                migrated = _metadata_migrate_support(existing, conv)
+                n_migrated += 1
+                by_key[key] = migrated
+                for i, rr in enumerate(rows):
+                    if _row_point_key(rr) == key:
+                        rows[i] = migrated
+                        break
+            else:
+                pending.append((ordinal, m_dm, eps, key, "support_upgrade", existing))
+                n_upgrade += 1
 
     workers = max(1, int(max_workers))
     start = time.perf_counter()
     if progress:
         print(
-            f"Pending {len(pending)} of {total} valid points; workers={workers}; "
-            f"backend={parallel_backend}; point_timeout={point_timeout_s}s; "
+            f"Pending work: {len(pending)} of {total} valid points = "
+            f"{n_central} central simulations + {n_upgrade} adaptive-b support repairs; "
+            f"workers={workers}; backend={parallel_backend}; point_timeout={point_timeout_s}s; "
             f"segment_timeout={cfg.ode_segment_walltime_s}s.",
             flush=True,
         )
+        if n_migrated:
+            print(f"  Metadata-migrated {n_migrated} previously converged support audits with zero new trajectories.", flush=True)
+        if n_upgrade:
+            print(
+                "  Support repairs reuse the checkpoint central estimate AND any previous "
+                "adaptive-b annulus summaries; they do NOT rerun the 2048-sample central Monte Carlo.",
+                flush=True,
+            )
 
     def upsert_row(row: dict, key) -> None:
-        """Replace the current-grid row for key instead of appending duplicates."""
         for i, existing in enumerate(rows):
             if _row_point_key(existing) == key:
-                # Prefer a new finite central estimate over an old timeout/failure
-                # placeholder.  Otherwise the newer result is the canonical row.
                 if _has_finite_central_estimate(row) or not _has_finite_central_estimate(existing):
                     rows[i] = row
                 return
@@ -2960,30 +3527,54 @@ def run_converged_valid_grid(
             checkpoint.parent.mkdir(parents=True, exist_ok=True)
             pd.DataFrame(rows).to_csv(checkpoint, index=False)
 
-    # Serial mode remains useful for detailed debugging.
+    def run_item(item, *, show_progress: bool):
+        ordinal, m_dm, eps, key, mode, baseline = item
+        t0 = time.perf_counter()
+        if mode == "support_upgrade":
+            audited = upgrade_existing_audit_point(
+                m_dm, eps, cfg, ground, conv, baseline,
+                seed=cfg.seed, progress=show_progress,
+            )
+        else:
+            audited = convergence_audit_point(
+                m_dm, eps, cfg, ground, conv, seed=cfg.seed, progress=show_progress
+            )
+        audited["worker_elapsed_s"] = float(time.perf_counter() - t0)
+        audited["wallclock_timeout"] = False
+        audited["worker_failure"] = False
+        audited["module_version"] = MODULE_VERSION
+        audited["point_ordinal"] = ordinal
+        audited["job_mode"] = mode
+        return audited
+
     if workers == 1:
-        for ordinal, m_dm, eps, key in pending:
+        for item in pending:
+            ordinal, m_dm, eps, key, mode, baseline = item
             if progress:
+                verb = "upgrade support for" if mode == "support_upgrade" else "simulate"
                 print(
-                    f"\n[converged staged] valid point {ordinal}/{total}: "
+                    f"\n[converged staged] {verb} valid point {ordinal}/{total}: "
                     f"m={m_dm:.6e} kg, eps={eps:.6e}", flush=True,
                 )
-            point_start = time.perf_counter()
-            audited = convergence_audit_point(
-                m_dm, eps, cfg, ground, conv, seed=cfg.seed, progress=progress
-            )
-            audited["worker_elapsed_s"] = float(time.perf_counter() - point_start)
-            audited["wallclock_timeout"] = False
-            audited["worker_failure"] = False
-            audited["module_version"] = MODULE_VERSION
-            audited["point_ordinal"] = ordinal
-            upsert_row(audited, key); completed.add(key); save_checkpoint()
+            try:
+                audited = run_item(item, show_progress=progress)
+            except Exception as exc:
+                if mode == "support_upgrade" and baseline is not None:
+                    audited = _incomplete_audit_from_baseline(
+                        baseline, f"support-upgrade-failure:{type(exc).__name__}: {exc}", worker_failure=True
+                    )
+                else:
+                    audited = _failed_audit_row(m_dm, eps, f"serial-worker-failure:{type(exc).__name__}")
+                audited["module_version"] = MODULE_VERSION
+                audited["point_ordinal"] = ordinal
+                audited["job_mode"] = mode
+            upsert_row(audited, key); save_checkpoint()
             if progress:
                 print(
-                    f"    done in {_format_duration(time.perf_counter()-point_start)} | "
-                    f"reliable phonon={audited['reliable_phonon']} "
-                    f"Gamma>=1={audited['reliable_ge1']} "
-                    f"Gamma_M={audited['reliable_exact_M']}", flush=True,
+                    f"    done | mode={mode} | b support={audited.get('adaptive_bmax_factor', np.nan)} B | "
+                    f"reliable phonon={audited.get('reliable_phonon', False)} "
+                    f"Gamma>=1={audited.get('reliable_ge1', False)} "
+                    f"Gamma_M={audited.get('reliable_exact_M', False)}", flush=True,
                 )
     elif parallel_backend.lower() == "thread":
         warnings.warn(
@@ -2991,32 +3582,28 @@ def run_converged_valid_grid(
             "Use parallel_backend='subprocess' for production runs."
         )
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="mcp-point") as pool:
-            futures = {
-                pool.submit(_audit_point_timed, ordinal, total, m_dm, eps, cfg, ground, conv):
-                (ordinal, m_dm, eps, key)
-                for ordinal, m_dm, eps, key in pending
-            }
+            futures = {pool.submit(run_item, item, show_progress=False): item for item in pending}
             done_now = 0
             for future in as_completed(futures):
-                ordinal0, m0, e0, key = futures[future]
+                item = futures[future]
+                ordinal, m_dm, eps, key, mode, baseline = item
                 try:
-                    ordinal, m_dm, eps, audited, elapsed = future.result()
-                    audited["worker_elapsed_s"] = elapsed
-                    audited["wallclock_timeout"] = False
-                    audited["worker_failure"] = False
+                    audited = future.result()
+                except Exception as exc:
+                    if mode == "support_upgrade" and baseline is not None:
+                        audited = _incomplete_audit_from_baseline(
+                            baseline, f"thread-support-upgrade-failure:{type(exc).__name__}: {exc}", worker_failure=True
+                        )
+                    else:
+                        audited = _failed_audit_row(m_dm, eps, f"thread-worker-failure:{type(exc).__name__}")
                     audited["module_version"] = MODULE_VERSION
                     audited["point_ordinal"] = ordinal
-                except Exception as exc:
-                    audited = _failed_audit_row(m0, e0, f"thread-worker-failure:{type(exc).__name__}")
-                    audited["module_version"] = MODULE_VERSION
-                    audited["point_ordinal"] = ordinal0
-                    elapsed = np.nan
-                upsert_row(audited, key); completed.add(key); done_now += 1; save_checkpoint()
+                    audited["job_mode"] = mode
+                upsert_row(audited, key); done_now += 1; save_checkpoint()
                 if progress:
                     print(
-                        f"[thread done {done_now}/{len(pending)}] point {ordinal0}/{total} "
-                        f"in {_format_duration(elapsed)} | reliable ph={audited['reliable_phonon']} "
-                        f"G>=1={audited['reliable_ge1']} G_M={audited['reliable_exact_M']}",
+                        f"[thread done {done_now}/{len(pending)}] {mode} point {ordinal}/{total} | "
+                        f"b support={audited.get('adaptive_bmax_factor', np.nan)} B",
                         flush=True,
                     )
     elif parallel_backend.lower() == "subprocess":
@@ -3029,21 +3616,21 @@ def run_converged_valid_grid(
         last_heartbeat = 0.0
 
         def launch(item):
-            ordinal, m_dm, eps, key = item
-            stem = f"point_{ordinal:03d}_{os.getpid()}_{int(time.time()*1000)}"
+            ordinal, m_dm, eps, key, mode, baseline = item
+            stem = f"point_{ordinal:03d}_{mode}_{os.getpid()}_{int(time.time()*1000)}"
             job_path = work_root / f"{stem}.job.json"
             result_path = work_root / f"{stem}.result.json"
             log_path = work_root / f"{stem}.log"
             job = {
                 "ordinal": ordinal, "total": total, "m_dm": m_dm, "eps": eps,
                 "cfg": asdict(cfg), "ground": asdict(ground), "conv": asdict(conv),
-                "result_path": str(result_path),
+                "result_path": str(result_path), "job_mode": mode,
             }
+            if mode == "support_upgrade":
+                job["baseline"] = baseline
             job_path.write_text(json.dumps(job, allow_nan=True))
             log_fh = log_path.open("wb")
             env = os.environ.copy()
-            # Eight independent workers should each use one BLAS/OpenMP thread;
-            # otherwise nested threading can oversubscribe the CPU severely.
             for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
                 env[name] = "1"
             env["PYTHONUNBUFFERED"] = "1"
@@ -3054,11 +3641,15 @@ def run_converged_valid_grid(
             )
             active[proc.pid] = {
                 "proc": proc, "ordinal": ordinal, "m_dm": m_dm, "eps": eps, "key": key,
+                "mode": mode, "baseline": baseline,
                 "start": time.perf_counter(), "job_path": job_path, "result_path": result_path,
                 "log_path": log_path, "log_fh": log_fh,
             }
             if progress:
-                print(f"  started point {ordinal}/{total} [pid {proc.pid}]: m={m_dm:.3e}, eps={eps:.3e}", flush=True)
+                print(
+                    f"  started {mode} point {ordinal}/{total} [pid {proc.pid}]: "
+                    f"m={m_dm:.3e}, eps={eps:.3e}", flush=True,
+                )
 
         while queue or active:
             while queue and len(active) < workers:
@@ -3075,7 +3666,7 @@ def run_converged_valid_grid(
                 if timed_out and rc is None:
                     if progress:
                         print(
-                            f"[WATCHDOG] point {meta['ordinal']}/{total} exceeded "
+                            f"[WATCHDOG] {meta['mode']} point {meta['ordinal']}/{total} exceeded "
                             f"{_format_duration(float(point_timeout_s))}; terminating pid {pid} and continuing.",
                             flush=True,
                         )
@@ -3095,13 +3686,15 @@ def run_converged_valid_grid(
                     payload = None
 
                 if timed_out:
-                    # If the central estimate had already completed, preserve it
-                    # and mark only the convergence audit as unresolved.  This
-                    # keeps the actual-rate heatmap populated even when a
-                    # secondary audit exceeds the wall-clock budget.
+                    preserved = None
                     if payload and payload.get("result") and _has_finite_central_estimate(payload["result"]):
+                        preserved = payload["result"]
+                    elif meta["mode"] == "support_upgrade" and meta["baseline"] is not None:
+                        preserved = meta["baseline"]
+                    if preserved is not None:
                         audited = _incomplete_audit_from_baseline(
-                            payload["result"], "point-wallclock-timeout-after-central",
+                            preserved,
+                            "point-wallclock-timeout-during-support-audit" if meta["mode"] == "support_upgrade" else "point-wallclock-timeout-after-central",
                             wallclock_timeout=True, worker_failure=False,
                         )
                         audited["central_estimate_recovered"] = True
@@ -3114,6 +3707,7 @@ def run_converged_valid_grid(
                     audited["worker_pid"] = int(pid)
                     audited["module_version"] = MODULE_VERSION
                     audited["point_ordinal"] = int(meta["ordinal"])
+                    audited["job_mode"] = meta["mode"]
                     audited["worker_log"] = str(meta["log_path"])
                 else:
                     if payload and payload.get("ok"):
@@ -3132,6 +3726,7 @@ def run_converged_valid_grid(
                         audited["worker_pid"] = int(pid)
                         audited["module_version"] = MODULE_VERSION
                         audited["point_ordinal"] = int(meta["ordinal"])
+                        audited["job_mode"] = meta["mode"]
                         audited["worker_log"] = str(meta["log_path"])
                     else:
                         reason = "worker-failure"
@@ -3139,51 +3734,51 @@ def run_converged_valid_grid(
                             reason += ":" + str(payload["error"])
                         elif rc is not None:
                             reason += f":returncode={rc}"
-                        audited = _failed_audit_row(meta["m_dm"], meta["eps"], reason)
-                        audited["central_estimate_recovered"] = False
+                        if meta["mode"] == "support_upgrade" and meta["baseline"] is not None:
+                            audited = _incomplete_audit_from_baseline(meta["baseline"], reason, worker_failure=True)
+                        else:
+                            audited = _failed_audit_row(meta["m_dm"], meta["eps"], reason)
+                        audited["central_estimate_recovered"] = bool(meta["mode"] == "support_upgrade")
                         audited["worker_elapsed_s"] = float(elapsed)
                         audited["worker_pid"] = int(pid)
                         audited["module_version"] = MODULE_VERSION
                         audited["point_ordinal"] = int(meta["ordinal"])
+                        audited["job_mode"] = meta["mode"]
                         audited["worker_log"] = str(meta["log_path"])
 
                 upsert_row(audited, meta["key"])
-                completed.add(meta["key"])
                 done_now += 1
                 save_checkpoint()
                 if progress:
                     print(
-                        f"[process done {done_now}/{len(pending)}] point {meta['ordinal']}/{total} "
-                        f"in {_format_duration(elapsed)} | reliable ph={audited['reliable_phonon']} "
-                        f"G>=1={audited['reliable_ge1']} G_M={audited['reliable_exact_M']} | "
+                        f"[process done {done_now}/{len(pending)}] {meta['mode']} point {meta['ordinal']}/{total} "
+                        f"in {_format_duration(elapsed)} | b support={audited.get('adaptive_bmax_factor', np.nan)} B | "
+                        f"reliable ph={audited.get('reliable_phonon', False)} "
+                        f"G>=1={audited.get('reliable_ge1', False)} G_M={audited.get('reliable_exact_M', False)} | "
                         f"timeout={audited.get('wallclock_timeout', False)} failure={audited.get('worker_failure', False)}",
                         flush=True,
                     )
-                for p in (meta["job_path"], meta["result_path"]):
+                for pp in (meta["job_path"], meta["result_path"]):
                     try:
-                        p.unlink(missing_ok=True)
+                        pp.unlink(missing_ok=True)
                     except Exception:
                         pass
                 del active[pid]
 
             if progress and active and (now - last_heartbeat >= max(float(heartbeat_s), 1.0)):
                 last_heartbeat = now
-                print(f"[heartbeat] {len(active)} workers running; {len(queue)} points queued.", flush=True)
+                print(f"[heartbeat] {len(active)} workers running; {len(queue)} jobs queued.", flush=True)
                 for meta in sorted(active.values(), key=lambda x: x["ordinal"]):
                     elapsed = now - meta["start"]
                     line = _last_nonempty_line(meta["log_path"])
                     suffix = f" | {line}" if line else ""
                     print(
-                        f"    point {meta['ordinal']}/{total}: {_format_duration(elapsed)} elapsed{suffix}",
+                        f"    {meta['mode']} point {meta['ordinal']}/{total}: {_format_duration(elapsed)} elapsed{suffix}",
                         flush=True,
                     )
     else:
         raise ValueError("parallel_backend must be 'subprocess' or 'thread'")
 
-    # Canonical final table: exactly one row for every point on the CURRENT
-    # pseudopotential-valid grid, in grid order.  This prevents old duplicate
-    # or stale checkpoint rows from inflating the denominator or fragmenting
-    # the plots.
     temp = pd.DataFrame(rows)
     canonical_rows, final_diag = _canonicalize_checkpoint(temp, valid) if len(temp) else ([], {})
     by_key = {_row_point_key(r): dict(r) for r in canonical_rows}
@@ -3201,12 +3796,14 @@ def run_converged_valid_grid(
     result = pd.DataFrame(ordered_rows)
     result = add_result_classifications(result, conv)
     central_complete = int(sum(_has_finite_central_estimate(r) for r in ordered_rows))
+    adaptive_complete = int(sum(_has_current_adaptive_bmax_audit(r, conv) for r in ordered_rows))
     if checkpoint is not None:
         result.to_csv(checkpoint, index=False)
     if progress:
         print(
             f"\nCurrent-grid table: {len(result)}/{total} unique valid points; "
             f"finite central estimates={central_complete}/{total}; "
+            f"current adaptive-b audits={adaptive_complete}/{total}; "
             f"session runtime={_format_duration(time.perf_counter()-start)}.", flush=True,
         )
     return result

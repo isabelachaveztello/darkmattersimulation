@@ -22,6 +22,8 @@ import numpy as np
 import pandas as pd
 from scipy.integrate import solve_ivp
 
+MODULE_VERSION = "2026-08-13.2"
+
 PI = math.pi
 KB = 1.380649e-23
 HBAR = 1.054571817e-34
@@ -90,6 +92,8 @@ class GroundRateConfig:
     metal_transport_steps: int = 96
     unresolved_policy: str = "zero"  # zero or nan
     save_trajectory_rows: bool = True
+    uncertainty_z: float = 1.96
+    save_uncertainty_tables: bool = True
 
 
 @dataclass
@@ -608,6 +612,166 @@ def _row_rate_weight(row: pd.Series, density_m3: float) -> float:
     return density_m3 * speed * PI * b_scan**2 * max(probability_weight, 0.0)
 
 
+def _safe_relative(se: float, estimate: float) -> float:
+    if not (np.isfinite(se) and np.isfinite(estimate)):
+        return np.nan
+    if estimate == 0.0:
+        return 0.0 if se == 0.0 else np.inf
+    return abs(float(se) / float(estimate))
+
+
+def _effective_strata(contributions: np.ndarray) -> float:
+    values = np.asarray(contributions, dtype=float)
+    values = values[np.isfinite(values) & (values >= 0.0)]
+    if values.size == 0:
+        return np.nan
+    denom = float(np.sum(values * values))
+    total = float(np.sum(values))
+    if denom <= 0.0:
+        return np.nan
+    return total * total / denom
+
+
+def _concentration_fractions(contributions: np.ndarray) -> tuple[float, float]:
+    values = np.asarray(contributions, dtype=float)
+    values = values[np.isfinite(values) & (values >= 0.0)]
+    total = float(np.sum(values))
+    if values.size == 0 or total <= 0.0:
+        return np.nan, np.nan
+    ordered = np.sort(values)[::-1]
+    return float(ordered[0] / total), float(np.sum(ordered[: min(5, len(ordered))]) / total)
+
+
+def _build_rate_uncertainty_tables(
+    results: pd.DataFrame,
+    replicas: int,
+    *,
+    z_value: float = 1.96,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Estimate the Monte Carlo uncertainty due to stochastic ground branches.
+
+    Each Test-1.5 source row is treated as a deterministic v16 stratum with
+    physical flux weight W_i.  The branch replicas provide independent draws
+    Y_ir inside that stratum.  For observable A,
+
+        R_A = sum_i W_i * mean_r(Y_ir)
+
+    and the stratified branch-MC variance is estimated by
+
+        Var(R_A) = sum_i W_i^2 * s_i^2 / n_i.
+
+    The same uncertainty is independently estimated by constructing a complete
+    total rate for every replica index r and taking std(R_r)/sqrt(R).  These
+    standard errors quantify only finite stochastic branch sampling; they do
+    not include phase-space discretization/support uncertainty from Tests
+    0--2.5, ODE-resolution uncertainty, or uncertainty in the copper model.
+    """
+    if len(results) == 0:
+        return pd.DataFrame(), pd.DataFrame(), {}
+
+    observable_specs = {
+        "phonon": ("mean_phonons", "selected_mode_phonon_rate_s_inv", "selected_mode_phonon_rate"),
+        "ge1": ("p_ge1", "event_rate_ge1_s_inv", "event_rate_ge1"),
+        "exact_M": ("p_exact_M", "event_rate_exact_M_s_inv", "event_rate_exact_M"),
+    }
+
+    source_records: list[dict[str, Any]] = []
+    for source_index, group in results.groupby("source_index", sort=True, dropna=False):
+        weight_values = pd.to_numeric(group["rate_weight_s_inv"], errors="coerce")
+        finite_weights = weight_values[np.isfinite(weight_values)]
+        weight = float(finite_weights.iloc[0]) if len(finite_weights) else np.nan
+        record: dict[str, Any] = {
+            "source_index": source_index,
+            "trajectory_id": str(group["trajectory_id"].iloc[0]) if "trajectory_id" in group.columns else str(source_index),
+            "rate_weight_s_inv": weight,
+            "n_branch_replicas_requested": int(replicas),
+            "n_branch_replicas_present": int(len(group)),
+            "resolved_fraction": float(pd.to_numeric(group["resolved"], errors="coerce").fillna(0.0).mean()) if "resolved" in group.columns else np.nan,
+        }
+        for short, (raw_col, _summary_name, _prefix) in observable_specs.items():
+            values = pd.to_numeric(group[raw_col], errors="coerce").to_numpy(float)
+            finite = values[np.isfinite(values)]
+            n = int(finite.size)
+            mean = float(np.mean(finite)) if n else np.nan
+            sd = float(np.std(finite, ddof=1)) if n > 1 else np.nan
+            se_mean = float(sd / math.sqrt(n)) if n > 1 else np.nan
+            contribution = float(weight * mean) if np.isfinite(weight) and np.isfinite(mean) else np.nan
+            contribution_se = float(abs(weight) * se_mean) if np.isfinite(weight) and np.isfinite(se_mean) else np.nan
+            record[f"{short}_n_finite_replicas"] = n
+            record[f"{short}_branch_mean"] = mean
+            record[f"{short}_branch_sd"] = sd
+            record[f"{short}_branch_mean_se"] = se_mean
+            record[f"{short}_rate_contribution_s_inv"] = contribution
+            record[f"{short}_rate_contribution_branch_mc_se_s_inv"] = contribution_se
+        source_records.append(record)
+
+    strata = pd.DataFrame(source_records)
+
+    replica_records: list[dict[str, Any]] = []
+    for replica, group in results.groupby("branch_replica", sort=True, dropna=False):
+        record = {"branch_replica": replica, "n_source_rows": int(group["source_index"].nunique())}
+        for short, (raw_col, _summary_name, _prefix) in observable_specs.items():
+            raw = pd.to_numeric(group[raw_col], errors="coerce").to_numpy(float)
+            weight = pd.to_numeric(group["rate_weight_s_inv"], errors="coerce").to_numpy(float)
+            finite = np.isfinite(raw) & np.isfinite(weight)
+            record[f"{short}_total_rate_s_inv"] = float(np.sum(weight[finite] * raw[finite])) if np.any(finite) else np.nan
+            record[f"{short}_n_finite_source_rows"] = int(np.sum(finite))
+        replica_records.append(record)
+    replica_totals = pd.DataFrame(replica_records)
+
+    extra: dict[str, Any] = {
+        "uncertainty_method": "stratified branch-replica Monte Carlo; v16 phase-space cells treated as deterministic strata",
+        "uncertainty_z": float(z_value),
+        "branch_mc_se_includes": "finite stochastic reflection/transmission/delayed-reemission branch sampling",
+        "branch_mc_se_excludes": "Tests 0-2.5 support/discretization, ODE-resolution error, density normalization, and phenomenological copper-model systematics",
+        "phase_space_statistical_se_available": False,
+    }
+
+    for short, (_raw_col, summary_name, prefix) in observable_specs.items():
+        contributions = pd.to_numeric(strata[f"{short}_rate_contribution_s_inv"], errors="coerce").to_numpy(float)
+        contribution_ses = pd.to_numeric(strata[f"{short}_rate_contribution_branch_mc_se_s_inv"], errors="coerce").to_numpy(float)
+        finite_contrib = contributions[np.isfinite(contributions)]
+        estimate = float(np.sum(finite_contrib)) if finite_contrib.size else np.nan
+
+        finite_se = contribution_ses[np.isfinite(contribution_ses)]
+        strat_se = float(math.sqrt(np.sum(finite_se * finite_se))) if finite_se.size else np.nan
+
+        replica_col = f"{short}_total_rate_s_inv"
+        replica_values = pd.to_numeric(replica_totals.get(replica_col, pd.Series(dtype=float)), errors="coerce").to_numpy(float)
+        replica_values = replica_values[np.isfinite(replica_values)]
+        replicate_se = float(np.std(replica_values, ddof=1) / math.sqrt(len(replica_values))) if len(replica_values) > 1 else np.nan
+
+        rel = _safe_relative(strat_se, estimate)
+        replicate_rel = _safe_relative(replicate_se, estimate)
+        max_fraction, top5_fraction = _concentration_fractions(contributions)
+
+        extra[summary_name] = estimate
+        extra[f"{prefix}_branch_mc_se_s_inv"] = strat_se
+        extra[f"{prefix}_branch_mc_rel_se"] = rel
+        extra[f"{prefix}_branch_mc_z_halfwidth_s_inv"] = float(z_value * strat_se) if np.isfinite(strat_se) else np.nan
+        extra[f"{prefix}_branch_mc_z_rel_halfwidth"] = float(z_value * rel) if np.isfinite(rel) else np.nan
+        extra[f"{prefix}_replica_total_se_s_inv"] = replicate_se
+        extra[f"{prefix}_replica_total_rel_se"] = replicate_rel
+        extra[f"{prefix}_effective_contributing_strata"] = _effective_strata(contributions)
+        extra[f"{prefix}_largest_stratum_fraction"] = max_fraction
+        extra[f"{prefix}_top5_strata_fraction"] = top5_fraction
+
+    if "resolved" in results.columns:
+        source_flux = strata[["rate_weight_s_inv", "resolved_fraction"]].copy()
+        weights = pd.to_numeric(source_flux["rate_weight_s_inv"], errors="coerce").to_numpy(float)
+        resolved_fraction = pd.to_numeric(source_flux["resolved_fraction"], errors="coerce").to_numpy(float)
+        finite = np.isfinite(weights) & np.isfinite(resolved_fraction) & (weights >= 0.0)
+        denom = float(np.sum(weights[finite])) if np.any(finite) else 0.0
+        extra["unresolved_flux_weight_fraction"] = (
+            float(np.sum(weights[finite] * (1.0 - resolved_fraction[finite])) / denom)
+            if denom > 0.0 else np.nan
+        )
+    else:
+        extra["unresolved_flux_weight_fraction"] = np.nan
+
+    return strata, replica_totals, extra
+
+
 def run_event_rate_from_test1p5(ns: dict[str, Any], prisms: Iterable[MetalPrism], config: GroundRateConfig, output_dir: str | Path | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     ctx = context_from_notebook(ns)
     prism_list = list(prisms)
@@ -658,13 +822,24 @@ def run_event_rate_from_test1p5(ns: dict[str, Any], prisms: Iterable[MetalPrism]
     results["ge1_rate_contribution_s_inv"] = results["rate_weight_s_inv"] * results["p_ge1"] / replicas
     results["exact_M_rate_contribution_s_inv"] = results["rate_weight_s_inv"] * results["p_exact_M"] / replicas
 
+    strata, replica_totals, uncertainty = _build_rate_uncertainty_tables(
+        results,
+        replicas,
+        z_value=float(config.uncertainty_z),
+    )
+
+    # Legacy grouped table retained for compatibility, but its old
+    # std(across rows)/sqrt(n_rows) is NOT reported as a statistical SE because
+    # the v16 source rows are deterministic unequal-weight phase-space strata.
     grouped = results.groupby("source_index", dropna=False).agg(
         phonon_rate=("phonon_rate_contribution_s_inv", "sum"),
         ge1_rate=("ge1_rate_contribution_s_inv", "sum"),
         exact_M_rate=("exact_M_rate_contribution_s_inv", "sum"),
         resolved_fraction=("resolved", "mean"),
     )
-    summary = pd.DataFrame([{
+
+    summary_record: dict[str, Any] = {
+        "module_version": MODULE_VERSION,
         "m_dm_kg": ctx.m_dm_kg,
         "eps": ctx.eps,
         "density_m3": config.density_m3,
@@ -674,18 +849,38 @@ def run_event_rate_from_test1p5(ns: dict[str, Any], prisms: Iterable[MetalPrism]
         "branch_replicas": replicas,
         "n_history_runs": len(results),
         "resolved_fraction": float(results["resolved"].mean()),
-        "selected_mode_phonon_rate_s_inv": float(results["phonon_rate_contribution_s_inv"].sum()),
-        "event_rate_ge1_s_inv": float(results["ge1_rate_contribution_s_inv"].sum()),
-        "event_rate_exact_M_s_inv": float(results["exact_M_rate_contribution_s_inv"].sum()),
-        "between_row_phonon_rate_se_s_inv": float(grouped["phonon_rate"].std(ddof=1) / math.sqrt(len(grouped))) if len(grouped) > 1 else np.nan,
         "runtime_s": time.perf_counter() - start,
         "pilot_input": str(pilot_path),
         "unresolved_policy": config.unresolved_policy,
-    }])
+        **uncertainty,
+    }
+    summary = pd.DataFrame([summary_record])
 
     if config.save_trajectory_rows:
         results.to_csv(output / "ground_plane_event_rate_histories.csv", index=False)
+    if config.save_uncertainty_tables:
+        strata.to_csv(output / "ground_plane_event_rate_strata_uncertainty.csv", index=False)
+        replica_totals.to_csv(output / "ground_plane_event_rate_replica_totals.csv", index=False)
     summary.to_csv(output / "ground_plane_event_rate_summary.csv", index=False)
-    (output / "ground_plane_event_rate_config.json").write_text(json.dumps({"config": asdict(config), "prisms": [asdict(p) for p in prism_list]}, indent=2), encoding="utf-8")
+    (output / "ground_plane_event_rate_config.json").write_text(
+        json.dumps(
+            {
+                "module_version": MODULE_VERSION,
+                "config": asdict(config),
+                "prisms": [asdict(p) for p in prism_list],
+                "uncertainty_interpretation": {
+                    "branch_mc_se": "standard error from finite stochastic ground-branch replicas within deterministic v16 source strata",
+                    "not_included": [
+                        "Tests 0-2.5 phase-space support/discretization uncertainty",
+                        "ODE/integration-resolution uncertainty",
+                        "dark-matter density normalization uncertainty",
+                        "phenomenological copper-model systematic uncertainty",
+                    ],
+                },
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     print(summary.to_string(index=False), flush=True)
     return results, summary
