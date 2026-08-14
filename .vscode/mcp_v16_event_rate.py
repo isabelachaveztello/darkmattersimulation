@@ -7,7 +7,7 @@ screening estimator and an adaptive solve_ivp staged ODE estimator.
 """
 from __future__ import annotations
 
-MODULE_VERSION = "2026-08-13.2"
+MODULE_VERSION = "2026-08-14.1"
 
 from dataclasses import dataclass, asdict, replace, field
 from pathlib import Path
@@ -219,6 +219,12 @@ class ScanConfig:
     invalid_z_margin_m: float = 1e-6
     max_ground_interactions: int = 3
     delayed_branch_samples: int = 1
+    # Full staged ground handling. ``enumerate`` keeps the historical weighted
+    # branch tree. ``stochastic`` samples the physical branch distribution and
+    # keeps a bounded number of path replicas, preventing combinatorial branch
+    # explosion at strongly interacting points while remaining unbiased.
+    ground_branch_mode: Literal["enumerate", "stochastic"] = "enumerate"
+    ground_path_replicas: int = 1
 
 
 def lower_hoa_quantum_geometry() -> dict:
@@ -414,19 +420,26 @@ def FDC_single(x1, y1, x2, y2, xyz, v, Z, q=c.e):
     return -Z * q * (anatangrad(x2, y2, xyz, v) - anatangrad(x2, y1, xyz, v) - anatangrad(x1, y2, xyz, v) + anatangrad(x1, y1, xyz, v))
 
 
+# Precompute immutable rectangular-electrode arrays once. FDC is called many
+# thousands of times inside solve_ivp; rebuilding these arrays in every RHS
+# evaluation dominated runtime in the high-mass/high-charge trap-sensitive
+# region.
+_DC_LAYER = np.full(len(c.vk), c.z0, dtype=float)
+_DC_LAYER[[19, 39]] = 0.0
+_DC_X1 = np.asarray([p[0] for p in c.xy1k], dtype=float)[None, :]
+_DC_Y1 = np.asarray([p[1] for p in c.xy1k], dtype=float)[None, :]
+_DC_X2 = np.asarray([p[0] for p in c.xy2k], dtype=float)[None, :]
+_DC_Y2 = np.asarray([p[1] for p in c.xy2k], dtype=float)[None, :]
+_DC_VOLT = np.asarray(c.vk, dtype=float)[None, :]
+
+
 def FDC(xyz, m_dm, eps):
     """Vectorized analytic DC force for all 40 rectangular electrodes."""
     pts = np.asarray(xyz, float).reshape(-1, 3)
     x = pts[:, 0][:, None]
     y = pts[:, 1][:, None]
-    layer = np.full(40, c.z0, dtype=float)
-    layer[[19, 39]] = 0.0
-    z = (pts[:, 2][:, None] + c.ion_height - layer[None, :])
-    x1 = np.asarray([p[0] for p in c.xy1k], float)[None, :]
-    y1 = np.asarray([p[1] for p in c.xy1k], float)[None, :]
-    x2 = np.asarray([p[0] for p in c.xy2k], float)[None, :]
-    y2 = np.asarray([p[1] for p in c.xy2k], float)[None, :]
-    volt = np.asarray(c.vk, float)[None, :]
+    z = (pts[:, 2][:, None] + c.ion_height - _DC_LAYER[None, :])
+    x1 = _DC_X1; y1 = _DC_Y1; x2 = _DC_X2; y2 = _DC_Y2; volt = _DC_VOLT
 
     def grad(xi, yi):
         dx = x - xi
@@ -1274,7 +1287,7 @@ def _check_segment_wallclock(start_wall: float, cfg: ScanConfig, label: str) -> 
         )
 
 
-def _integrate_dm_segment(r0, v0, q0, t0, m_dm, eps, target_radius, inbound, cfg, ground, include_quadrature=True):
+def _integrate_dm_segment(r0, v0, q0, t0, m_dm, eps, target_radius, inbound, cfg, ground, include_quadrature=True, escape_radius=None):
     """Adaptive solve_ivp DM-only outer stage with CSG and radial events."""
     y0 = np.r_[np.asarray(r0, float), np.asarray(v0, float), np.asarray(q0, float)]
     t0 = float(t0)
@@ -1302,17 +1315,23 @@ def _integrate_dm_segment(r0, v0, q0, t0, m_dm, eps, target_radius, inbound, cfg
     ground_event.terminal = True
     ground_event.direction = -1
 
+    def escape_event(t, y):
+        return float(np.linalg.norm(y[0:3]) - float(escape_radius))
+    escape_event.terminal = True
+    escape_event.direction = +1
+
     def invalid_event(t, y):
         return float(y[2] - zfloor)
     invalid_event.terminal = True
     invalid_event.direction = -1
 
     try:
+        events = (radius_event, ground_event, invalid_event) if escape_radius is None else (radius_event, ground_event, invalid_event, escape_event)
         sol = solve_ivp(
             rhs, (t0, t1), y0, method=cfg.ode_method,
             rtol=float(cfg.ode_rtol), atol=_ode_atol_vector(cfg, "dm"),
             max_step=float(cfg.ode_max_step_s),
-            events=(radius_event, ground_event, invalid_event),
+            events=events,
         )
     except _SegmentWallclockTimeout as exc:
         return {"status": "wallclock_timeout", "t": t0, "r": y0[0:3], "v": y0[3:6], "q": y0[6:12], "nfev": 0, "message": str(exc)}
@@ -1321,7 +1340,7 @@ def _integrate_dm_segment(r0, v0, q0, t0, m_dm, eps, target_radius, inbound, cfg
 
     y = sol.y[:, -1]
     status = "timeout"
-    event_order = ("radius", "ground", "invalid_z")
+    event_order = ("radius", "ground", "invalid_z") if escape_radius is None else ("radius", "ground", "invalid_z", "escape")
     event_times = [(float(ev[0]), name) for ev, name in zip(sol.t_events, event_order) if len(ev)]
     if event_times:
         _, status = min(event_times, key=lambda pair: pair[0])
@@ -1396,6 +1415,22 @@ def _integrate_coupled_core(r0, v0, q0, t0, m_dm, eps, R_switch, cfg):
     return {"status":status,"t":float(sol.t[-1]),"r_dm":y[0:3].copy(),"v_dm":y[3:6].copy(),"r_ion":y[6:9].copy(),"v_ion":y[9:12].copy(),"q":y[12:18].copy(),"nfev":int(sol.nfev),"message":str(sol.message)}
 
 
+def _sample_one_ground_branch(
+    r_hit: np.ndarray, v_in: np.ndarray, m_dm: float, eps: float, ground: CopperGroundPlane,
+    rng: np.random.Generator,
+) -> dict | None:
+    """Draw one physical ground branch, including a fresh effusive velocity."""
+    candidates = ground_plane_branches(
+        r_hit, v_in, m_dm, eps, ground, rng, delayed_samples=1
+    )
+    candidates = [b for b in candidates if b.get("weight", 0.0) > 0.0 and np.linalg.norm(b.get("v", np.zeros(3))) > 0.0]
+    if not candidates:
+        return None
+    probs = np.asarray([float(b["weight"]) for b in candidates], dtype=float)
+    probs /= probs.sum()
+    return candidates[int(rng.choice(len(candidates), p=probs))]
+
+
 def staged_single_sample(m_dm: float, eps: float, speed: float, b: float, theta: float, alpha: float, psi: float, cfg: ScanConfig, ground: CopperGroundPlane, seed: int) -> dict:
     regime = classify_collision_regime(speed, b)
     radii = certify_radii(m_dm, eps, speed, b, theta, alpha, psi, cfg)
@@ -1415,20 +1450,58 @@ def staged_single_sample(m_dm: float, eps: float, speed: float, b: float, theta:
 
     r0, v0 = initial_state_from_v16(b, R_far, psi, alpha, theta, speed)
     rng = np.random.default_rng(seed)
-    active = [{"weight": 1.0, "r": r0, "v": v0, "q": np.zeros(6), "t": 0.0, "interactions": 0, "labels": []}]
+    active = [{"weight": 1.0, "r": r0, "v": v0, "q": np.zeros(6), "t": 0.0, "interactions": 0, "labels": [], "ground_replicated": False}]
     reached = []
     outer_terminal_labels = []
     nfev = 0
     while active:
         st = active.pop()
-        seg = _integrate_dm_segment(st["r"], st["v"], st["q"], st["t"], m_dm, eps, R_switch, True, cfg, ground)
+        # The original launch begins at R_far and therefore has no outward
+        # escape event at t=0. After any ground interaction, however, a reflected
+        # or re-emitted branch may be moving outward. Give it both legitimate
+        # outcomes: reach R_switch inward, or escape back through R_far outward.
+        # This prevents reflected branches from integrating for max_stage_time_s
+        # while waiting for an inward crossing that will never occur.
+        escape_radius = R_far if st["interactions"] > 0 else None
+        seg = _integrate_dm_segment(
+            st["r"], st["v"], st["q"], st["t"], m_dm, eps, R_switch, True, cfg, ground,
+            escape_radius=escape_radius,
+        )
         nfev += seg["nfev"]
         if seg["status"] == "radius":
             reached.append({**st, **seg}); continue
+        if seg["status"] == "escape":
+            q = seg["q"]
+            I = q[0::2] + 1j * q[1::2]
+            total_escape_y = st["weight"] * phonon_yield_from_integral(I)
+            # Escaping reflected/re-emitted trajectories still contribute their
+            # accumulated force history even though they never enter the core.
+            # Store it until total_y is initialized below.
+            st["escape_yield"] = total_escape_y
+            reached.append({**st, **seg, "escaped_without_core": True})
+            continue
         if seg["status"] == "ground" and st["interactions"] < cfg.max_ground_interactions:
-            for br in ground_plane_branches(seg["r"], seg["v"], m_dm, eps, ground, rng, delayed_samples=cfg.delayed_branch_samples):
-                if br["weight"] <= 0 or np.linalg.norm(br["v"]) <= 0: continue
-                active.append({"weight": st["weight"] * br["weight"], "r": br["r"], "v": br["v"], "q": seg["q"], "t": seg["t"] + br["delay_s"], "interactions": st["interactions"] + 1, "labels": st["labels"] + [br["kind"]]})
+            if str(getattr(cfg, "ground_branch_mode", "enumerate")).lower() == "stochastic":
+                # At the first material hit create a small fixed number of path
+                # replicas. Thereafter each replica samples exactly one physical
+                # branch at each hit. The path count is therefore bounded by
+                # ground_path_replicas instead of growing exponentially with
+                # delayed_branch_samples**interactions.
+                nrep = max(int(getattr(cfg, "ground_path_replicas", 1)), 1) if not st.get("ground_replicated", False) else 1
+                for _ in range(nrep):
+                    br = _sample_one_ground_branch(seg["r"], seg["v"], m_dm, eps, ground, rng)
+                    if br is None:
+                        continue
+                    active.append({
+                        "weight": st["weight"] / nrep, "r": br["r"], "v": br["v"],
+                        "q": seg["q"], "t": seg["t"] + br["delay_s"],
+                        "interactions": st["interactions"] + 1,
+                        "labels": st["labels"] + [br["kind"]], "ground_replicated": True,
+                    })
+            else:
+                for br in ground_plane_branches(seg["r"], seg["v"], m_dm, eps, ground, rng, delayed_samples=cfg.delayed_branch_samples):
+                    if br["weight"] <= 0 or np.linalg.norm(br["v"]) <= 0: continue
+                    active.append({"weight": st["weight"] * br["weight"], "r": br["r"], "v": br["v"], "q": seg["q"], "t": seg["t"] + br["delay_s"], "interactions": st["interactions"] + 1, "labels": st["labels"] + [br["kind"]], "ground_replicated": st.get("ground_replicated", False)})
         elif seg["status"] != "ground":
             # Keep conservative losses visible to the convergence audit,
             # especially wall-clock/physical-time timeouts.
@@ -1437,6 +1510,10 @@ def staged_single_sample(m_dm: float, eps: float, speed: float, b: float, theta:
     total_y = np.zeros(3)
     status_labels = list(outer_terminal_labels)
     for st in reached:
+        if st.get("escaped_without_core", False):
+            total_y += np.asarray(st.get("escape_yield", np.zeros(3)), dtype=float)
+            status_labels.append("escape")
+            continue
         core = _integrate_coupled_core(st["r"], st["v"], st["q"], st["t"], m_dm, eps, R_switch, cfg)
         nfev += core["nfev"]
         if core["status"] != "core_exit":
@@ -1910,9 +1987,48 @@ class ConvergenceConfig:
     # apparent failure is consistent with tail-estimator noise.  This lets us
     # distinguish a genuinely long physical tail from a 128-sample upper-bound
     # fluctuation, while reusing previous annulus summaries whenever possible.
-    adaptive_bmax_tail_max_samples: int = 1024
+    adaptive_bmax_tail_max_samples: int = 4096
     adaptive_bmax_tail_sample_growth: float = 2.0
-    adaptive_bmax_version: int = 2
+    # Tail annuli use a mixture proposal: area-uniform samples preserve broad
+    # coverage while log-uniform samples resolve the inner edge of each octave,
+    # where a decaying long-range signal usually contributes most strongly.
+    # Every draw carries the exact 2*pi*b/q(b) importance weight, so new v3
+    # samples can be pooled with older area-uniform annulus summaries without
+    # changing the target integral.
+    tail_importance_area_fraction: float = 0.50
+    # The outer launch sphere is a numerical boundary, not a material surface.
+    # Tail-only samples may enlarge it when an otherwise valid annulus would be
+    # clipped by b < 0.8 R_outer. The old central estimate remains reusable.
+    adaptive_bmax_allow_outer_radius_expand: bool = True
+    adaptive_bmax_outer_radius_max_m: float = 0.50
+    # Diagnostic asymptotic analysis for points that reach the explicit support
+    # ceiling. This never silently promotes a point to support-converged; it
+    # quantifies whether the measured octave contributions appear to decay and
+    # estimates a conservative residual-tail bound for triage / v16 follow-up.
+    asymptotic_tail_enabled: bool = True
+    asymptotic_tail_min_annuli: int = 3
+    asymptotic_tail_fit_annuli: int = 5
+    asymptotic_tail_min_r2: float = 0.75
+    asymptotic_tail_min_exponent: float = 0.15
+    asymptotic_tail_max_ratio: float = 0.90
+    adaptive_bmax_version: int = 3
+
+    # Cost-aware central estimator. When the cheap regime census shows that a
+    # large fraction of the proposal is trap-sensitive, evaluating every one of
+    # the nominal 2048 samples with the full ODE is unnecessarily expensive.
+    # The multifidelity estimator uses a large cheap screening sample plus an
+    # independent staged-minus-screening correction sample. It is unbiased for
+    # the same staged observable because the staged and screening kernels are
+    # identical by policy in the Rutherford/adiabatic regimes, so expensive ODE
+    # work is required only for trap-sensitive correction draws.
+    central_estimator_mode: Literal["auto", "direct", "multifidelity"] = "auto"
+    multifidelity_trigger_trap_fraction: float = 0.15
+    multifidelity_regime_pilot_samples: int = 512
+    multifidelity_screening_samples: int = 8192
+    multifidelity_correction_min_samples: int = 64
+    multifidelity_correction_max_samples: int = 384
+    multifidelity_correction_check_every: int = 32
+
     numerical_rel_tol: float = 0.05
     confidence_z: float = 2.0
     outer_radius_factor: float = 1.5
@@ -1978,6 +2094,9 @@ def _importance_sample_contribution(
     *,
     b_annulus_factors: tuple[float, float] | None = None,
     b_support_factor: float = 1.0,
+    annulus_area_fraction: float | None = None,
+    annulus_expand_outer_radius: bool = False,
+    annulus_outer_radius_max_m: float | None = None,
 ) -> dict:
     """Evaluate one staged importance sample.
 
@@ -2017,10 +2136,18 @@ def _importance_sample_contribution(
             raise ValueError("Require 0 <= lower b factor < upper b factor")
         blo = flo * b_nominal
         bhi_requested = fhi * b_nominal
-        # The v16 initial-state construction requires b < R.  Keep a generous
-        # margin and explicitly flag any clipping so such a point cannot be
-        # certified as b-support converged.
-        bhi_limit = 0.80 * cfg.R_outer_m
+        # The source sphere is a numerical launch surface. For tail-only work,
+        # enlarge it when necessary instead of declaring a geometrically valid
+        # annulus missing merely because the production R_outer was chosen for
+        # the nominal support. The enlargement is capped explicitly.
+        local_cfg = cfg
+        if annulus_expand_outer_radius and bhi_requested > 0.80 * cfg.R_outer_m:
+            cap = float(annulus_outer_radius_max_m) if annulus_outer_radius_max_m is not None else float(cfg.R_outer_m)
+            needed = max(float(cfg.R_outer_m), 1.35 * bhi_requested, ground.enclosing_radius_m + 1e-3)
+            local_R = min(max(cap, float(cfg.R_outer_m)), needed)
+            if local_R > cfg.R_outer_m * (1.0 + 1e-14):
+                local_cfg = replace(cfg, R_outer_m=float(local_R))
+        bhi_limit = 0.80 * local_cfg.R_outer_m
         bhi = min(bhi_requested, bhi_limit)
         clipped = bool(bhi_requested > bhi_limit * (1.0 + 1e-12))
         if bhi <= blo * (1.0 + 1e-14):
@@ -2033,10 +2160,28 @@ def _importance_sample_contribution(
                 "regime": "",
                 "branch": "",
                 "b_tail_clipped": clipped,
+                "tail_outer_radius_m": float(local_cfg.R_outer_m),
             }
-        u = float(common["u_b"][i])
-        b = math.sqrt(blo * blo + max(min(u, 1.0), 0.0) * (bhi * bhi - blo * blo))
-        area_weight = PI * (bhi * bhi - blo * blo)
+        u = max(min(float(common["u_b"][i]), 1.0 - np.finfo(float).eps), np.finfo(float).tiny)
+        # Exact mixture importance sampling over the annular area measure
+        # dA = 2*pi*b db.  p=1 reproduces the legacy area-uniform sampler;
+        # p<1 adds a log-uniform component that concentrates resolution near
+        # the inner edge of an octave without biasing the integral.
+        p_area = 1.0 if annulus_area_fraction is None else float(np.clip(annulus_area_fraction, 0.0, 1.0))
+        if blo <= 0.0 or p_area >= 1.0 - 1e-15:
+            b = math.sqrt(blo * blo + u * (bhi * bhi - blo * blo))
+            area_weight = PI * (bhi * bhi - blo * blo)
+        else:
+            choose_area = float(common["mix"][i]) < p_area
+            if choose_area:
+                b = math.sqrt(blo * blo + u * (bhi * bhi - blo * blo))
+            else:
+                b = blo * math.exp(u * math.log(bhi / blo))
+            q_area = 2.0 * b / max(bhi * bhi - blo * blo, np.finfo(float).tiny)
+            q_log = 1.0 / max(b * math.log(bhi / blo), np.finfo(float).tiny)
+            q_mix = p_area * q_area + (1.0 - p_area) * q_log
+            area_weight = 2.0 * PI * b / max(q_mix, np.finfo(float).tiny)
+        cfg = local_cfg
 
     theta = float(common["theta"][i])
     alpha = float(common["alpha"][i])
@@ -2056,7 +2201,204 @@ def _importance_sample_contribution(
         "regime": str(res.get("regime", "")),
         "branch": str(res.get("branch", "")),
         "b_tail_clipped": clipped,
+        "tail_outer_radius_m": float(cfg.R_outer_m),
     }
+
+
+def _screening_importance_sample_contribution(
+    m_dm: float,
+    eps: float,
+    cfg: ScanConfig,
+    ground: CopperGroundPlane,
+    common: dict[str, np.ndarray],
+    i: int,
+    *,
+    b_support_factor: float = 1.0,
+) -> dict:
+    """Evaluate the cheap screening contribution for one ordinary support draw.
+
+    The draw and weight are identical to :func:`_importance_sample_contribution`.
+    For trap-sensitive samples this serves as a control variate; for Rutherford
+    and adiabatic samples it is exactly the staged policy and therefore needs no
+    ODE correction.
+    """
+    vscale = math.sqrt(2 * KB * cfg.temperature_K / m_dm)
+    speed = float(common["x_speed"][i]) * vscale
+    mean_v = mean_speed_maxwell(m_dm, cfg.temperature_K)
+    b_nominal = bmax_rutherford(m_dm, eps, speed, cfg)
+    factor = max(float(b_support_factor), 1.0)
+    b_requested = factor * b_nominal
+    b_limit = 0.80 * cfg.R_outer_m
+    b_support = min(b_requested, b_limit)
+    b, area_weight = sample_b_with_weight(
+        b_support, float(common["mix"][i]), float(common["u_b"][i]), cfg
+    )
+    theta = float(common["theta"][i]); alpha = float(common["alpha"][i]); psi = float(common["psi"][i])
+    seed = int(common["ground_seed"][i])
+    radii = certify_radii(m_dm, eps, speed, b, theta, alpha, psi, cfg)
+    R_far = max(float(radii["R_far_m"]), ground.enclosing_radius_m + 1e-3)
+    res = screening_single_sample(m_dm, eps, speed, b, theta, alpha, psi, R_far, cfg, ground, seed)
+    nk = max(float(res["yield_modes"][cfg.target_mode]), 0.0)
+    w = density_for_point(m_dm, eps, cfg)["source_density_m3"] * mean_v * area_weight
+    regime = classify_collision_regime(speed, b)
+    return {
+        "phonon_rate_s": w * nk,
+        "event_rate_ge1_s": w * (1.0 - math.exp(-min(nk, 700.0))),
+        "event_rate_exact_M_s": w * poisson_exact_probability(nk, cfg.exact_phonon_number),
+        "regime": regime, "status": str(res.get("branch", "")), "nfev": 0.0,
+    }
+
+
+def _cheap_trap_sensitive_fraction(m_dm: float, eps: float, cfg: ScanConfig, n: int, seed: int) -> float:
+    """Cheap proposal census used only to select the central estimator."""
+    n = max(int(n), 1)
+    common = make_common_samples(n, int(seed))
+    vscale = math.sqrt(2 * KB * cfg.temperature_K / m_dm)
+    hits = 0
+    for i in range(n):
+        speed = float(common["x_speed"][i]) * vscale
+        b_nominal = bmax_rutherford(m_dm, eps, speed, cfg)
+        b, _ = sample_b_with_weight(b_nominal, float(common["mix"][i]), float(common["u_b"][i]), cfg)
+        hits += int(classify_collision_regime(speed, b) == "trap_sensitive")
+    return float(hits / n)
+
+
+def multifidelity_point_estimate(
+    m_dm: float,
+    eps: float,
+    cfg: ScanConfig,
+    ground: CopperGroundPlane,
+    conv: ConvergenceConfig,
+    *,
+    seed: int | None = None,
+    progress: bool = False,
+) -> dict:
+    """Unbiased screening-control-variate estimator for expensive points.
+
+    Let S be the cheap screening contribution and F the staged contribution.
+    The estimator is E[S] + E[F-S]. The second expectation is evaluated with an
+    independent sample. Since F=S by construction in Rutherford/adiabatic
+    regimes, the expensive staged ODE is called only for trap-sensitive draws.
+    Independent base/correction streams give
+        SE^2 = SE(Sbar)^2 + SE(Deltabar)^2.
+    """
+    metrics = mathieu_metrics(m_dm, eps, cfg)
+    if not metrics["pseudopotential_valid"]:
+        raise ValueError("Refusing to sample a pseudopotential-invalid point")
+    seed0 = cfg.seed if seed is None else int(seed)
+    n_base = max(int(conv.multifidelity_screening_samples), 2)
+    n_corr_max = max(int(conv.multifidelity_correction_max_samples), 2)
+    n_corr_min = min(max(int(conv.multifidelity_correction_min_samples), 2), n_corr_max)
+    check_every = max(int(conv.multifidelity_correction_check_every), 1)
+    base_common = make_common_samples(n_base, seed0 + 700001)
+    corr_common = make_common_samples(n_corr_max, seed0 + 900001)
+    metric_names = ("phonon_rate_s", "event_rate_ge1_s", "event_rate_exact_M_s")
+
+    base_vals = {k: np.empty(n_base, dtype=float) for k in metric_names}
+    for i in range(n_base):
+        rec = _screening_importance_sample_contribution(m_dm, eps, cfg, ground, base_common, i)
+        for k in metric_names: base_vals[k][i] = rec[k]
+    base_stats = {k: _metric_stats(base_vals[k]) for k in metric_names}
+
+    deltas = {k: [] for k in metric_names}
+    statuses = []; regimes = []; nfevs = []
+    ode_samples = 0; used = 0; stop_reason = "correction_max_samples"
+    for i in range(n_corr_max):
+        scr = _screening_importance_sample_contribution(m_dm, eps, cfg, ground, corr_common, i)
+        regime = str(scr["regime"]); regimes.append(regime)
+        if regime == "trap_sensitive":
+            full = _importance_sample_contribution(m_dm, eps, cfg, ground, corr_common, i)
+            ode_samples += 1
+            statuses.append(str(full.get("status", "")))
+            nfevs.append(float(full.get("nfev", 0.0)))
+            for k in metric_names: deltas[k].append(float(full[k]) - float(scr[k]))
+        else:
+            statuses.append("analytic_shortcut")
+            nfevs.append(0.0)
+            for k in metric_names: deltas[k].append(0.0)
+        used = i + 1
+
+        if progress and (used == 1 or used % check_every == 0 or used == n_corr_max):
+            combined = {}
+            for k in metric_names:
+                ds = _metric_stats(np.asarray(deltas[k], dtype=float))
+                mean = base_stats[k]["mean"] + ds["mean"]
+                se = math.sqrt(base_stats[k]["se"] ** 2 + ds["se"] ** 2) if np.isfinite(ds["se"]) else np.inf
+                combined[k] = se / abs(mean) if mean != 0.0 else np.inf
+            print(
+                f"      MF correction {used}/{n_corr_max}: trap-sensitive ODE={ode_samples}; "
+                f"rel.SE phonon={combined['phonon_rate_s']:.3g}, "
+                f"Gamma>=1={combined['event_rate_ge1_s']:.3g}, Gamma_M={combined['event_rate_exact_M_s']:.3g}",
+                flush=True,
+            )
+        if used >= n_corr_min and (used % check_every == 0 or used == n_corr_max):
+            rels=[]
+            for k in ("phonon_rate_s", "event_rate_ge1_s"):
+                ds = _metric_stats(np.asarray(deltas[k], dtype=float))
+                mean = base_stats[k]["mean"] + ds["mean"]
+                se = math.sqrt(base_stats[k]["se"] ** 2 + ds["se"] ** 2) if np.isfinite(ds["se"]) else np.inf
+                rels.append(se / abs(mean) if mean != 0.0 else np.inf)
+            if all(np.isfinite(x) and x <= conv.mc_target_rel_se for x in rels):
+                stop_reason = "target_rel_se"
+                break
+
+    result = {
+        "m_dm_kg": float(m_dm), "eps": float(eps),
+        "mathieu_stable": bool(metrics["mathieu_stable"]), "pseudopotential_valid": True,
+        "q_max": float(metrics["q_max"]), "secular_over_rf": float(metrics["secular_over_rf"]),
+        "reference_class": int(metrics["reference_class"]),
+        "effective_samples": int(n_base + used),
+        "adaptive_stop_reason": stop_reason,
+        "central_estimator": "screening_control_variate",
+        "multifidelity_screening_samples": int(n_base),
+        "multifidelity_correction_samples": int(used),
+        "multifidelity_trap_sensitive_ode_samples": int(ode_samples),
+        "trap_sensitive_fraction": float(np.mean([r == "trap_sensitive" for r in regimes])) if regimes else 0.0,
+        "mean_nfev": float(np.mean(nfevs)) if nfevs else 0.0,
+        "timeout_fraction": float(np.mean(["timeout" in s for s in statuses])) if statuses else 0.0,
+        "analytic_shortcut_fraction": float(np.mean([r != "trap_sensitive" for r in regimes])) if regimes else 1.0,
+    }
+    for metric, prefix in (("phonon_rate_s","phonon"),("event_rate_ge1_s","ge1"),("event_rate_exact_M_s","exact_M")):
+        ds = _metric_stats(np.asarray(deltas[metric], dtype=float))
+        mean = float(base_stats[metric]["mean"] + ds["mean"])
+        se = float(math.sqrt(base_stats[metric]["se"] ** 2 + ds["se"] ** 2)) if np.isfinite(ds["se"]) else np.inf
+        result[metric] = mean
+        result[f"{prefix}_se_s"] = se; result[f"{prefix}_mc_se_s"] = se
+        result[f"{prefix}_mc_rel_se"] = se / abs(mean) if mean != 0.0 else np.inf
+        result[f"{prefix}_screening_base_s"] = float(base_stats[metric]["mean"])
+        result[f"{prefix}_staged_correction_s"] = float(ds["mean"])
+        result[f"{prefix}_correction_se_s"] = float(ds["se"])
+    result["mc_rel_se"] = result["phonon_mc_rel_se"]
+    result["event_mc_rel_se"] = result["ge1_mc_rel_se"]
+    result["event_exact_M_mc_rel_se"] = result["exact_M_mc_rel_se"]
+    return result
+
+
+def central_point_estimate_auto(
+    m_dm: float, eps: float, cfg: ScanConfig, ground: CopperGroundPlane, conv: ConvergenceConfig,
+    *, seed: int | None = None, progress: bool = False,
+) -> dict:
+    seed0 = cfg.seed if seed is None else int(seed)
+    mode = str(conv.central_estimator_mode).lower()
+    if mode not in {"auto", "direct", "multifidelity"}:
+        raise ValueError(f"Unknown central_estimator_mode={conv.central_estimator_mode!r}")
+    frac = _cheap_trap_sensitive_fraction(
+        m_dm, eps, cfg, conv.multifidelity_regime_pilot_samples, seed0 + 500001
+    )
+    use_mf = mode == "multifidelity" or (mode == "auto" and frac >= conv.multifidelity_trigger_trap_fraction)
+    if progress:
+        chosen = "multifidelity screening-control-variate" if use_mf else "direct staged"
+        print(f"    central estimator: {chosen}; pilot trap-sensitive fraction={frac:.3f}", flush=True)
+    if use_mf:
+        out = multifidelity_point_estimate(m_dm, eps, cfg, ground, conv, seed=seed0, progress=progress)
+    else:
+        out = adaptive_point_estimate(m_dm, eps, cfg, ground, conv, seed=seed0, progress=progress)
+        out["central_estimator"] = "direct_staged"
+        out["trap_sensitive_fraction"] = frac
+        out["multifidelity_screening_samples"] = 0
+        out["multifidelity_correction_samples"] = 0
+        out["multifidelity_trap_sensitive_ode_samples"] = 0
+    return out
 
 
 def point_sample_contributions(
@@ -2069,6 +2411,9 @@ def point_sample_contributions(
     seed: int | None = None,
     b_annulus_factors: tuple[float, float] | None = None,
     b_support_factor: float = 1.0,
+    annulus_area_fraction: float | None = None,
+    annulus_expand_outer_radius: bool = False,
+    annulus_outer_radius_max_m: float | None = None,
     progress: bool = False,
 ) -> dict:
     """Return raw per-sample staged rate contributions for one valid point."""
@@ -2088,12 +2433,16 @@ def point_sample_contributions(
         "regime": [],
         "branch": [],
         "b_tail_clipped": [],
+        "tail_outer_radius_m": [],
     }
     for i in range(n_samples):
         rec = _importance_sample_contribution(
             m_dm, eps, cfg, ground, common, i,
             b_annulus_factors=b_annulus_factors,
             b_support_factor=b_support_factor,
+            annulus_area_fraction=annulus_area_fraction,
+            annulus_expand_outer_radius=annulus_expand_outer_radius,
+            annulus_outer_radius_max_m=annulus_outer_radius_max_m,
         )
         for key in out:
             out[key].append(rec[key])
@@ -2102,6 +2451,7 @@ def point_sample_contributions(
     for key in ("phonon_rate_s", "event_rate_ge1_s", "event_rate_exact_M_s", "nfev"):
         out[key] = np.asarray(out[key], dtype=float)
     out["b_tail_clipped"] = np.asarray(out["b_tail_clipped"], dtype=bool)
+    out["tail_outer_radius_m"] = np.asarray(out["tail_outer_radius_m"], dtype=float)
     return out
 
 
@@ -2311,6 +2661,159 @@ def _reusable_tail_summaries(row: dict, conv: ConvergenceConfig):
     return ann1, ann2
 
 
+
+def _adaptive_annulus_records(row: dict, label: str, conv: ConvergenceConfig) -> list[dict]:
+    """Recover unique octave-annulus summaries from checkpoint history.
+
+    Each support step stores [S,2S] and [2S,4S]. Consecutive steps therefore
+    duplicate one octave. Keep the highest-statistics non-clipped version of
+    each octave so old checkpoint evidence can be reused for asymptotic triage.
+    """
+    try:
+        hist = json.loads(str(row.get("adaptive_bmax_history", "[]")))
+    except Exception:
+        hist = []
+    if not isinstance(hist, list):
+        hist = []
+    best = {}
+    f1 = float(conv.b_tail_factor_1)
+    for h in hist:
+        if not isinstance(h, dict) or _safe_bool(h.get("clipped", False), False):
+            continue
+        try:
+            support = float(h.get("support_factor", np.nan))
+        except Exception:
+            continue
+        if not np.isfinite(support) or support <= 0:
+            continue
+        mm = h.get("metrics", {}).get(label, {}) if isinstance(h.get("metrics", {}), dict) else {}
+        if not isinstance(mm, dict):
+            continue
+        for which, lower in (("ann1", support), ("ann2", support * f1)):
+            try:
+                mean = float(mm.get(f"{which}_mean", np.nan))
+                se = float(mm.get(f"{which}_se", np.nan))
+                n = int(mm.get(f"{which}_n", h.get("annulus_n", 0)) or 0)
+            except Exception:
+                continue
+            if not (np.isfinite(mean) and np.isfinite(se) and n > 0 and mean >= 0):
+                continue
+            key = round(math.log(lower, f1), 10)
+            rec = {"lower_factor": float(lower), "upper_factor": float(lower * f1),
+                   "mean": mean, "se": se, "n": n}
+            old = best.get(key)
+            if old is None or n > old["n"] or (n == old["n"] and se < old["se"]):
+                best[key] = rec
+    return sorted(best.values(), key=lambda r: r["lower_factor"])
+
+
+def _asymptotic_tail_diagnostics(row: dict, conv: ConvergenceConfig) -> dict:
+    """Fit octave-rate decay and estimate a conservative residual-tail bound.
+
+    This is diagnostic-only. Even a good fit does not set b_tail_*_pass=True;
+    the point remains support-unresolved until explicit support or a dedicated
+    single-point calculation certifies it.
+    """
+    out = {}
+    enabled = bool(conv.asymptotic_tail_enabled)
+    out["asymptotic_tail_enabled"] = enabled
+    out["asymptotic_tail_analysis_version"] = 1
+    if not enabled:
+        out["asymptotic_tail_status"] = "disabled"
+        return out
+    support = float(row.get("adaptive_bmax_factor", 1.0) or 1.0)
+    metric_map = {
+        "phonon": "phonon_rate_s",
+        "ge1": "event_rate_ge1_s",
+        "exact_M": "event_rate_exact_M_s",
+    }
+    statuses = []
+    for label, metric in metric_map.items():
+        recs = _adaptive_annulus_records(row, label, conv)
+        # Prefer the outermost measured octaves; include enough points just
+        # inside the current support to diagnose whether a decay law has settled.
+        fit_n = max(int(conv.asymptotic_tail_fit_annuli), int(conv.asymptotic_tail_min_annuli))
+        usable = [r for r in recs if r["mean"] > 0 and r["lower_factor"] >= support / (float(conv.b_tail_factor_1) ** max(fit_n - 2, 0))]
+        usable = usable[-fit_n:]
+        status = "insufficient_history"
+        p = r2 = ratio_fit = ratio_recent = ratio_upper = rem_upper = frac_upper = np.nan
+        if len(usable) >= int(conv.asymptotic_tail_min_annuli):
+            x = np.log(np.asarray([r["lower_factor"] for r in usable], float))
+            y = np.log(np.asarray([r["mean"] for r in usable], float))
+            try:
+                slope, intercept = np.polyfit(x, y, 1)
+                yhat = slope * x + intercept
+                ss_res = float(np.sum((y - yhat) ** 2))
+                ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+                r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 1.0
+                p = float(-slope)
+                ratio_fit = float(conv.b_tail_factor_1 ** (-p)) if np.isfinite(p) else np.nan
+            except Exception:
+                p = r2 = ratio_fit = np.nan
+            # Consecutive outer-octave ratio, with a conservative 2-sigma ratio.
+            a, b = usable[-2], usable[-1]
+            if math.isclose(b["lower_factor"], a["upper_factor"], rel_tol=1e-8, abs_tol=0.0) and a["mean"] > 0:
+                ratio_recent = b["mean"] / a["mean"]
+                den_lo = a["mean"] - conv.confidence_z * a["se"]
+                num_hi = b["mean"] + conv.confidence_z * b["se"]
+                ratio_upper = num_hi / den_lo if den_lo > 0 else np.inf
+            # Find the first omitted octave beginning at the current central support.
+            first = next((r for r in recs if math.isclose(r["lower_factor"], support, rel_tol=1e-8, abs_tol=0.0)), None)
+            quality = bool(
+                np.isfinite(p) and p >= conv.asymptotic_tail_min_exponent
+                and np.isfinite(r2) and r2 >= conv.asymptotic_tail_min_r2
+                and np.isfinite(ratio_fit) and ratio_fit < 1.0
+            )
+            ratio_bound = max(x for x in (ratio_fit, ratio_recent, ratio_upper) if np.isfinite(x)) if any(np.isfinite(x) for x in (ratio_fit, ratio_recent, ratio_upper)) else np.inf
+            if quality and first is not None and np.isfinite(ratio_bound) and ratio_bound < min(1.0, conv.asymptotic_tail_max_ratio):
+                first_hi = max(0.0, first["mean"] + conv.confidence_z * first["se"])
+                rem_upper = first_hi / max(1.0 - ratio_bound, np.finfo(float).tiny)
+                central = max(float(row.get(metric, 0.0) or 0.0), 0.0)
+                frac_upper = rem_upper / max(central + rem_upper, np.finfo(float).tiny)
+                status = "candidate_bounded" if frac_upper <= conv.b_tail_fraction_tol else "decaying_above_tolerance"
+            elif quality:
+                status = "decay_fit_but_no_conservative_ratio"
+            elif np.isfinite(p) and p > 0:
+                status = "weak_or_nonstationary_decay"
+            else:
+                status = "nondecaying_or_noisy"
+        out[f"asymptotic_{label}_annuli_used"] = int(len(usable))
+        out[f"asymptotic_{label}_exponent_p"] = p
+        out[f"asymptotic_{label}_fit_r2"] = r2
+        out[f"asymptotic_{label}_ratio_fit"] = ratio_fit
+        out[f"asymptotic_{label}_ratio_recent"] = ratio_recent
+        out[f"asymptotic_{label}_ratio_upper"] = ratio_upper
+        out[f"asymptotic_{label}_remainder_rate_upper_s"] = rem_upper
+        out[f"asymptotic_{label}_remainder_fraction_upper"] = frac_upper
+        out[f"asymptotic_{label}_status"] = status
+        statuses.append(status)
+    if statuses and all(x == "candidate_bounded" for x in statuses):
+        overall = "candidate_bounded_all"
+    elif any(x in ("nondecaying_or_noisy", "insufficient_history") for x in statuses):
+        overall = "not_bounded"
+    elif any(x == "decaying_above_tolerance" for x in statuses):
+        overall = "decaying_above_tolerance"
+    else:
+        overall = "mixed_or_weak_decay"
+    out["asymptotic_tail_status"] = overall
+    out["asymptotic_tail_diagnostic_only"] = True
+    out["asymptotic_tail_recommendation"] = (
+        "single_point_v16_or_manual_tail_study" if overall != "candidate_bounded_all"
+        else "candidate_for_manual_support_review"
+    )
+    return out
+
+
+def add_asymptotic_tail_diagnostics(df: pd.DataFrame, conv: ConvergenceConfig) -> pd.DataFrame:
+    out = df.copy()
+    if out.empty:
+        return out
+    records = [_asymptotic_tail_diagnostics(dict(row), conv) for _, row in out.iterrows()]
+    extra = pd.DataFrame(records, index=out.index)
+    for col in extra.columns:
+        out[col] = extra[col]
+    return out
+
 def _adaptive_b_tail_test(
     m_dm: float,
     eps: float,
@@ -2325,8 +2828,8 @@ def _adaptive_b_tail_test(
 ) -> dict:
     """Repair/enlarge impact-parameter support while reusing previous results.
 
-    Version 2 is deliberately incremental.  If ``baseline`` already contains a
-    v1 adaptive-b result, its enlarged central estimate and final two annulus
+    Version 3 is deliberately incremental and status-aware.  If ``baseline`` already contains a
+    older adaptive-b result, its enlarged central estimate and final two annulus
     summaries are reused.  The algorithm first increases annulus statistics
     when a failed 2-sigma bound is statistically ambiguous.  It expands the
     physical support only when the tail is demonstrably too large (or after the
@@ -2349,7 +2852,7 @@ def _adaptive_b_tail_test(
         if not np.isfinite(float(baseline.get(metric, np.nan))):
             raise ValueError(f"Cannot adapt b_max without finite baseline {metric}")
 
-    # Reuse any previously enlarged central support.  A v1 row's rate already
+    # Reuse any previously enlarged central support.  An older row's rate already
     # contains all promoted annuli up to adaptive_bmax_factor; do not double count.
     previous_factor = float(baseline.get("adaptive_bmax_factor", 1.0) or 1.0)
     previous_factor = previous_factor if np.isfinite(previous_factor) and previous_factor >= 1.0 else 1.0
@@ -2358,22 +2861,25 @@ def _adaptive_b_tail_test(
     except Exception:
         previous_version = 0
     reusable_ann1, reusable_ann2 = _reusable_tail_summaries(baseline, conv)
-    # Complete v1 rows and partial v2 watchdog snapshots both contain enough
-    # information to continue from their CURRENT support.  Requiring the old
-    # audit to be complete would throw away support-repair progress after a
-    # watchdog termination.
-    reuse_previous = bool(previous_version > 0 and reusable_ann1 is not None and reusable_ann2 is not None)
+    # Reuse the enlarged central integral whenever an older adaptive run exists.
+    # If its final audit was geometry-clipped, keep the central rate/support but
+    # resample the two OUTER annuli with the v3 expandable launch sphere.
+    reuse_central = bool(previous_version > 0)
+    reuse_tail = bool(reusable_ann1 is not None and reusable_ann2 is not None)
+    if reuse_tail and conv.adaptive_bmax_allow_outer_radius_expand:
+        reuse_tail = not bool(reusable_ann1.get("clipped", False) or reusable_ann2.get("clipped", False))
+    reuse_previous = reuse_central
     current_rate = {metric: float(baseline[metric]) for metric, _ in metrics}
     current_var = {
         label: (_baseline_standard_error(baseline, label) ** 2 if np.isfinite(_baseline_standard_error(baseline, label)) else np.inf)
         for _, label in metrics
     }
-    support_factor = float(previous_factor if reuse_previous else 1.0)
-    expansion_count = int(float(baseline.get("adaptive_bmax_expansions", 0) or 0)) if reuse_previous else 0
-    old_tail_samples = int(float(baseline.get("adaptive_bmax_tail_samples", 0) or 0)) if reuse_previous else 0
+    support_factor = float(previous_factor if reuse_central else 1.0)
+    expansion_count = int(float(baseline.get("adaptive_bmax_expansions", 0) or 0)) if reuse_central else 0
+    old_tail_samples = int(float(baseline.get("adaptive_bmax_tail_samples", 0) or 0)) if reuse_central else 0
     total_tail_samples_new = 0
     try:
-        history = json.loads(str(baseline.get("adaptive_bmax_history", "[]"))) if reuse_previous else []
+        history = json.loads(str(baseline.get("adaptive_bmax_history", "[]"))) if reuse_central else []
         if not isinstance(history, list): history = []
     except Exception:
         history = []
@@ -2396,16 +2902,21 @@ def _adaptive_b_tail_test(
         nonlocal total_tail_samples_new
         rec = point_sample_contributions(
             m_dm, eps, cfg, ground, int(n), seed=int(ann_seed),
-            b_annulus_factors=(lo_factor, hi_factor), progress=progress,
+            b_annulus_factors=(lo_factor, hi_factor),
+            annulus_area_fraction=conv.tail_importance_area_fraction,
+            annulus_expand_outer_radius=conv.adaptive_bmax_allow_outer_radius_expand,
+            annulus_outer_radius_max_m=conv.adaptive_bmax_outer_radius_max_m,
+            progress=progress,
         )
         total_tail_samples_new += int(n)
-        out = {"metrics": {}, "clipped": bool(np.any(rec["b_tail_clipped"])), "n": int(n)}
+        out = {"metrics": {}, "clipped": bool(np.any(rec["b_tail_clipped"])), "n": int(n),
+               "max_outer_radius_m": float(np.nanmax(rec["tail_outer_radius_m"])) if len(rec["tail_outer_radius_m"]) else float(cfg.R_outer_m)}
         for metric, label in metrics:
             out["metrics"][label] = _metric_stats(rec[metric])
         return out
 
-    ann1 = reusable_ann1 if reuse_previous else None
-    ann2 = reusable_ann2 if reuse_previous else None
+    ann1 = reusable_ann1 if reuse_tail else None
+    ann2 = reusable_ann2 if reuse_tail else None
     if ann1 is None or ann2 is None:
         ann1 = sample_annulus(support_factor, support_factor * f1, conv.b_tail_samples, seed)
         ann2 = sample_annulus(support_factor * f1, support_factor * f2, conv.b_tail_samples, seed + 1)
@@ -2476,6 +2987,12 @@ def _adaptive_b_tail_test(
         out["adaptive_bmax_tail_samples"] = int(old_tail_samples + total_tail_samples_new)
         out["adaptive_bmax_tail_samples_new"] = int(total_tail_samples_new)
         out["adaptive_bmax_reused_previous"] = bool(reuse_previous)
+        out["adaptive_bmax_reused_tail_summaries"] = bool(reuse_tail)
+        out["adaptive_bmax_tail_importance_area_fraction"] = float(conv.tail_importance_area_fraction)
+        out["adaptive_bmax_tail_outer_radius_m"] = float(max(
+            ann1.get("max_outer_radius_m", cfg.R_outer_m) if isinstance(ann1, dict) else cfg.R_outer_m,
+            ann2.get("max_outer_radius_m", cfg.R_outer_m) if isinstance(ann2, dict) else cfg.R_outer_m,
+        ))
         out["adaptive_bmax_history"] = json.dumps(history, separators=(",", ":"), allow_nan=True)
         out["b_tail_clipped"] = bool(fs["clipped"] if fs else False)
         all_support_pass = True
@@ -2515,7 +3032,7 @@ def _adaptive_b_tail_test(
 
     while True:
         final_stats = evaluate_step()
-        history.append({**final_stats, "source": "v2_repair", "resample_round": int(resample_round)})
+        history.append({**final_stats, "source": "v3_repair", "resample_round": int(resample_round)})
         if progress:
             msg = ", ".join(
                 f"{lab}: mean={100*final_stats['metrics'][lab]['frac_mean']:.1f}% "
@@ -2562,8 +3079,8 @@ def _adaptive_b_tail_test(
 
         next_factor = support_factor * f1
         if expansion_count >= max_expansions or next_factor > max_factor * (1.0 + 1e-12):
-            history[-1]["decision"] = "support_unresolved_max_factor"
-            status = "support_unresolved_max_factor"
+            history[-1]["decision"] = "max_factor_reached"
+            status = "max_factor_reached"
             break
 
         history[-1]["decision"] = "expand_support"
@@ -2582,7 +3099,9 @@ def _adaptive_b_tail_test(
         ann1 = ann2
         ann2 = sample_annulus(support_factor * f1, support_factor * f2, max(int(ann1.get("n", conv.b_tail_samples)), int(conv.b_tail_samples)), seed + 20000 + expansion_count)
 
-    return build_output(status, True, final_stats)
+    final_out = build_output(status, True, final_stats)
+    final_out.update(_asymptotic_tail_diagnostics(final_out, conv))
+    return final_out
 
 def _b_tail_test(
     m_dm: float,
@@ -2650,6 +3169,12 @@ def _complete_convergence_audit_from_baseline(
             m_dm, eps, cfg, ground, conv, baseline, seed=seed0 + 101, progress=progress,
             checkpoint_callback=checkpoint_callback,
         )
+        # Persist the completed support state BEFORE any paired numerical audit.
+        # If a later numerical variant hits the point watchdog, resume keeps the
+        # newly certified/repaired b-domain instead of falling back to the last
+        # in-progress support snapshot.
+        if checkpoint_callback is not None:
+            checkpoint_callback(result)
     else:
         tail = _b_tail_test(m_dm, eps, cfg, ground, conv, baseline, seed=seed0 + 101, progress=progress)
         result = {**baseline, **tail}
@@ -2766,6 +3291,7 @@ def _complete_convergence_audit_from_baseline(
         "ground": replace(
             cfg,
             delayed_branch_samples=max(1, int(cfg.delayed_branch_samples * conv.delayed_samples_factor)),
+            ground_path_replicas=max(1, int(getattr(cfg, "ground_path_replicas", 1) * conv.delayed_samples_factor)),
             max_ground_interactions=cfg.max_ground_interactions + int(conv.extra_ground_interactions),
         ),
     }
@@ -2885,7 +3411,7 @@ def convergence_audit_point(
     seed0 = cfg.seed if seed is None else int(seed)
     if progress:
         print("    central adaptive estimate", flush=True)
-    baseline = adaptive_point_estimate(m_dm, eps, cfg, ground, conv, seed=seed0, progress=progress)
+    baseline = central_point_estimate_auto(m_dm, eps, cfg, ground, conv, seed=seed0, progress=progress)
     return _complete_convergence_audit_from_baseline(
         m_dm, eps, cfg, ground, conv, baseline, seed0=seed0, progress=progress
     )
@@ -3284,13 +3810,19 @@ def _incomplete_audit_from_baseline(
         np.isfinite(float(row.get("timeout_fraction", np.nan)))
         and float(row.get("timeout_fraction", np.inf)) <= 0.01
     )
-    row["b_tail_clipped"] = False
+    # Preserve any support audit that had already completed before the later
+    # numerical/worker interruption. Older versions erased these flags, causing
+    # a timeout during a numerical audit to throw away valid tail work.
+    support_done = _safe_bool(row.get("adaptive_bmax_complete", False), False)
+    if not support_done:
+        row["b_tail_clipped"] = False
     for label in ("phonon", "ge1", "exact_M"):
         row[f"mc_{label}_pass"] = False
-        row[f"b_tail_{label}_pass"] = False
+        if not support_done:
+            row[f"b_tail_{label}_pass"] = False
+            row[f"b_tail_{label}_fraction_upper"] = np.nan
         row[f"numerical_{label}_pass"] = False
         row[f"reliable_{label}"] = False
-        row[f"b_tail_{label}_fraction_upper"] = np.nan
     row["reliable_all"] = False
     row["reliability_failures"] = str(reason)
     row["audit_incomplete_reason"] = str(reason)
@@ -3326,7 +3858,7 @@ def _run_worker_job(job_path: str | Path) -> int:
         if not mathieu_metrics(m_dm, eps, cfg)["pseudopotential_valid"]:
             raise ValueError("Refusing to audit a pseudopotential-invalid point")
         seed0 = cfg.seed
-        if job_mode == "support_upgrade":
+        if job_mode != "central":
             baseline = dict(job["baseline"])
             print("    reusing checkpoint central estimate; no central MC rerun", flush=True)
             partial = _incomplete_audit_from_baseline(
@@ -3347,13 +3879,22 @@ def _run_worker_job(job_path: str | Path) -> int:
                 snap["point_ordinal"] = ordinal
                 snap["job_mode"] = job_mode
                 write_payload({"ok": False, "partial": True, "phase": "support_progress", "result": snap})
-            audited = upgrade_existing_audit_point(
-                m_dm, eps, cfg, ground, conv, baseline, seed=seed0, progress=True,
-                checkpoint_callback=support_checkpoint,
-            )
+            if job_mode == "asymptotic_only":
+                audited = dict(baseline)
+                audited["adaptive_bmax_version"] = int(conv.adaptive_bmax_version)
+                audited["adaptive_bmax_status"] = "max_factor_reached"
+                audited.update(_asymptotic_tail_diagnostics(audited, conv))
+                audited["support_repair_action"] = "asymptotic_only"
+                print("    asymptotic annulus analysis from checkpoint history; zero new trajectories", flush=True)
+            else:
+                audited = upgrade_existing_audit_point(
+                    m_dm, eps, cfg, ground, conv, baseline, seed=seed0, progress=True,
+                    checkpoint_callback=support_checkpoint,
+                )
+                audited["support_repair_action"] = job_mode
         else:
             print("    central adaptive estimate", flush=True)
-            baseline = adaptive_point_estimate(
+            baseline = central_point_estimate_auto(
                 m_dm, eps, cfg, ground, conv, seed=seed0, progress=True
             )
             partial = dict(baseline)
@@ -3387,7 +3928,7 @@ def _run_worker_job(job_path: str | Path) -> int:
                 baseline, f"worker-exception-after-central:{type(exc).__name__}: {exc}",
                 worker_failure=True,
             )
-            partial["central_estimate_reused"] = bool(job_mode == "support_upgrade")
+            partial["central_estimate_reused"] = bool(job_mode != "central")
             partial["worker_elapsed_s"] = float(time.perf_counter() - t0)
             partial["worker_pid"] = int(os.getpid())
             partial["module_version"] = MODULE_VERSION
@@ -3410,6 +3951,66 @@ def _run_worker_job(job_path: str | Path) -> int:
         return 2
 
 
+
+def _numerical_audit_is_current(row: dict, conv: ConvergenceConfig) -> bool:
+    if not _has_complete_numerical_audit(row):
+        return False
+    try:
+        sf = float(row.get("adaptive_bmax_factor", 1.0) or 1.0)
+        nf = float(row.get("numerical_audit_b_support_factor", np.nan))
+    except Exception:
+        return False
+    return bool(np.isfinite(nf) and math.isclose(sf, nf, rel_tol=1e-12, abs_tol=1e-15)
+                and not _safe_bool(row.get("secondary_audit_skipped", True), True))
+
+
+def _needs_numerical_upgrade(row: dict, conv: ConvergenceConfig) -> bool:
+    if not all(_safe_bool(row.get(f"b_tail_{lab}_pass", False), False) for lab in ("phonon", "ge1", "exact_M")):
+        return False
+    candidates = []
+    for lab in ("phonon", "ge1", "exact_M"):
+        try: rel = float(row.get(f"{lab}_mc_rel_se", np.nan))
+        except Exception: rel = np.nan
+        candidates.append(np.isfinite(rel) and rel <= conv.well_converged_rel_se)
+    return bool(any(candidates) and not _numerical_audit_is_current(row, conv))
+
+
+def _support_repair_mode(row: dict, conv: ConvergenceConfig) -> str | None:
+    """Choose the cheapest next action for a finite checkpoint row."""
+    status = str(row.get("adaptive_bmax_status", ""))
+    complete = _safe_bool(row.get("adaptive_bmax_complete", False), False)
+    if status == "support_unresolved_max_factor":
+        status = "max_factor_reached"
+    if complete and status == "converged":
+        return "numerical_upgrade" if _needs_numerical_upgrade(row, conv) else None
+    if complete and status == "tail_noise_limited":
+        # Upgrade legacy 1024-sample tails to the new ceiling, but do not
+        # resubmit a current v3 row that has already exhausted that ceiling.
+        try: n_tail = min(int(float(row.get("b_tail1_n", 0) or 0)), int(float(row.get("b_tail2_n", 0) or 0)))
+        except Exception: n_tail = 0
+        return "tail_refine" if n_tail < int(conv.adaptive_bmax_tail_max_samples) else None
+    if complete and status == "max_factor_reached":
+        if int(float(row.get("asymptotic_tail_analysis_version", 0) or 0)) >= 1:
+            return None
+        # If a lower confidence bound is not clearly above tolerance, more tail
+        # statistics are still worthwhile. Otherwise use existing annulus history
+        # for asymptotic triage with zero new trajectories.
+        clear = False
+        for lab in ("phonon", "ge1", "exact_M"):
+            try: lo = float(row.get(f"b_tail_{lab}_fraction_lower", np.nan))
+            except Exception: lo = np.nan
+            clear = clear or (np.isfinite(lo) and lo > conv.b_tail_fraction_tol)
+        return "asymptotic_only" if clear else "tail_refine"
+    if complete and status == "geometry_limited":
+        try: used_R = float(row.get("adaptive_bmax_tail_outer_radius_m", 0.0) or 0.0)
+        except Exception: used_R = 0.0
+        if used_R >= float(conv.adaptive_bmax_outer_radius_max_m) * (1.0 - 1e-12):
+            return None
+        return "geometry_repair"
+    if not complete or status in ("in_progress", ""):
+        return "support_resume"
+    return "support_upgrade"
+
 def run_converged_valid_grid(
     cfg: ScanConfig,
     ground: CopperGroundPlane | None = None,
@@ -3426,15 +4027,14 @@ def run_converged_valid_grid(
 ) -> pd.DataFrame:
     """Audit all pseudopotential-valid points with incremental checkpoint reuse.
 
-    Version 2026-08-13.2 reuses prior central/support work and distinguishes pending work:
+    Version 2026-08-14.1 is status-aware and reuses prior work aggressively.
 
-    * ``central``: no finite central result exists, so the full adaptive central
-      Monte Carlo must be run;
-    * ``support_upgrade``: a finite legacy central result already exists.  The
-      expensive [0,B] sample is reused and only the adaptive outer-b annuli plus
-      any required paired numerical diagnostics are run.
-
-    Therefore enabling adaptive b_max does *not* throw away previous results.
+    Missing central estimates use the direct/multifidelity production estimator.
+    Finite checkpoint rows are scheduled only for their cheapest missing task:
+    tail-noise refinement, geometry repair, support resume, asymptotic-only
+    analysis, or paired numerical audit. Previously converged support is migrated
+    without new trajectories. No finite central estimate is rerun merely because
+    the tail-repair algorithm was upgraded.
     """
     ground = ground or CopperGroundPlane()
     conv = conv or ConvergenceConfig()
@@ -3472,46 +4072,44 @@ def run_converged_valid_grid(
     by_key = {_row_point_key(r): dict(r) for r in rows if _row_point_key(r) is not None}
     total = len(valid)
     pending = []
-    n_central = 0
-    n_upgrade = 0
+    mode_counts = {}
     n_migrated = 0
     for ordinal, rec in enumerate(valid.to_dict("records"), 1):
         m_dm = float(rec["m_dm_kg"]); eps = float(rec["eps"])
         key = _row_point_key(rec)
         existing = by_key.get(key)
         if existing is None or not _has_finite_central_estimate(existing):
-            pending.append((ordinal, m_dm, eps, key, "central", None))
-            n_central += 1
-        elif conv.adaptive_bmax_enabled and not _has_current_adaptive_bmax_audit(existing, conv):
-            if _can_metadata_migrate_support(existing, conv):
+            mode = "central"; baseline = None
+        else:
+            baseline = existing
+            if conv.adaptive_bmax_enabled and not _has_current_adaptive_bmax_audit(existing, conv) and _can_metadata_migrate_support(existing, conv):
                 migrated = _metadata_migrate_support(existing, conv)
+                migrated.update(_asymptotic_tail_diagnostics(migrated, conv))
                 n_migrated += 1
-                by_key[key] = migrated
+                by_key[key] = migrated; baseline = migrated
                 for i, rr in enumerate(rows):
                     if _row_point_key(rr) == key:
-                        rows[i] = migrated
-                        break
-            else:
-                pending.append((ordinal, m_dm, eps, key, "support_upgrade", existing))
-                n_upgrade += 1
+                        rows[i] = migrated; break
+            mode = _support_repair_mode(baseline, conv) if conv.adaptive_bmax_enabled else ("numerical_upgrade" if _needs_numerical_upgrade(baseline, conv) else None)
+        if mode is not None:
+            pending.append((ordinal, m_dm, eps, key, mode, baseline))
+            mode_counts[mode] = mode_counts.get(mode, 0) + 1
 
     workers = max(1, int(max_workers))
     start = time.perf_counter()
     if progress:
+        mode_text = ", ".join(f"{k}={v}" for k, v in sorted(mode_counts.items())) or "none"
         print(
-            f"Pending work: {len(pending)} of {total} valid points = "
-            f"{n_central} central simulations + {n_upgrade} adaptive-b support repairs; "
+            f"Pending work: {len(pending)} of {total} valid points ({mode_text}); "
             f"workers={workers}; backend={parallel_backend}; point_timeout={point_timeout_s}s; "
-            f"segment_timeout={cfg.ode_segment_walltime_s}s.",
-            flush=True,
+            f"segment_timeout={cfg.ode_segment_walltime_s}s.", flush=True,
         )
         if n_migrated:
             print(f"  Metadata-migrated {n_migrated} previously converged support audits with zero new trajectories.", flush=True)
-        if n_upgrade:
+        if any(k != "central" for k in mode_counts):
             print(
-                "  Support repairs reuse the checkpoint central estimate AND any previous "
-                "adaptive-b annulus summaries; they do NOT rerun the 2048-sample central Monte Carlo.",
-                flush=True,
+                "  Repair jobs reuse finite central estimates and prior adaptive-b history; only the missing "
+                "tail / geometry / numerical work is performed.", flush=True,
             )
 
     def upsert_row(row: dict, key) -> None:
@@ -3530,15 +4128,24 @@ def run_converged_valid_grid(
     def run_item(item, *, show_progress: bool):
         ordinal, m_dm, eps, key, mode, baseline = item
         t0 = time.perf_counter()
-        if mode == "support_upgrade":
+        if mode == "central":
+            audited = convergence_audit_point(
+                m_dm, eps, cfg, ground, conv, seed=cfg.seed, progress=show_progress
+            )
+        elif mode == "asymptotic_only":
+            audited = dict(baseline)
+            # Promote the metadata version because v3's max-factor action is a
+            # zero-trajectory diagnostic using already measured octave history.
+            audited["adaptive_bmax_version"] = int(conv.adaptive_bmax_version)
+            audited["adaptive_bmax_status"] = "max_factor_reached"
+            audited.update(_asymptotic_tail_diagnostics(audited, conv))
+            audited["support_repair_action"] = "asymptotic_only"
+        else:
             audited = upgrade_existing_audit_point(
                 m_dm, eps, cfg, ground, conv, baseline,
                 seed=cfg.seed, progress=show_progress,
             )
-        else:
-            audited = convergence_audit_point(
-                m_dm, eps, cfg, ground, conv, seed=cfg.seed, progress=show_progress
-            )
+            audited["support_repair_action"] = mode
         audited["worker_elapsed_s"] = float(time.perf_counter() - t0)
         audited["wallclock_timeout"] = False
         audited["worker_failure"] = False
@@ -3551,7 +4158,7 @@ def run_converged_valid_grid(
         for item in pending:
             ordinal, m_dm, eps, key, mode, baseline = item
             if progress:
-                verb = "upgrade support for" if mode == "support_upgrade" else "simulate"
+                verb = f"{mode} for" if mode != "central" else "simulate"
                 print(
                     f"\n[converged staged] {verb} valid point {ordinal}/{total}: "
                     f"m={m_dm:.6e} kg, eps={eps:.6e}", flush=True,
@@ -3559,7 +4166,7 @@ def run_converged_valid_grid(
             try:
                 audited = run_item(item, show_progress=progress)
             except Exception as exc:
-                if mode == "support_upgrade" and baseline is not None:
+                if mode != "central" and baseline is not None:
                     audited = _incomplete_audit_from_baseline(
                         baseline, f"support-upgrade-failure:{type(exc).__name__}: {exc}", worker_failure=True
                     )
@@ -3590,7 +4197,7 @@ def run_converged_valid_grid(
                 try:
                     audited = future.result()
                 except Exception as exc:
-                    if mode == "support_upgrade" and baseline is not None:
+                    if mode != "central" and baseline is not None:
                         audited = _incomplete_audit_from_baseline(
                             baseline, f"thread-support-upgrade-failure:{type(exc).__name__}: {exc}", worker_failure=True
                         )
@@ -3626,7 +4233,7 @@ def run_converged_valid_grid(
                 "cfg": asdict(cfg), "ground": asdict(ground), "conv": asdict(conv),
                 "result_path": str(result_path), "job_mode": mode,
             }
-            if mode == "support_upgrade":
+            if mode != "central":
                 job["baseline"] = baseline
             job_path.write_text(json.dumps(job, allow_nan=True))
             log_fh = log_path.open("wb")
@@ -3689,12 +4296,12 @@ def run_converged_valid_grid(
                     preserved = None
                     if payload and payload.get("result") and _has_finite_central_estimate(payload["result"]):
                         preserved = payload["result"]
-                    elif meta["mode"] == "support_upgrade" and meta["baseline"] is not None:
+                    elif meta["mode"] != "central" and meta["baseline"] is not None:
                         preserved = meta["baseline"]
                     if preserved is not None:
                         audited = _incomplete_audit_from_baseline(
                             preserved,
-                            "point-wallclock-timeout-during-support-audit" if meta["mode"] == "support_upgrade" else "point-wallclock-timeout-after-central",
+                            "point-wallclock-timeout-during-support-audit" if meta["mode"] != "central" else "point-wallclock-timeout-after-central",
                             wallclock_timeout=True, worker_failure=False,
                         )
                         audited["central_estimate_recovered"] = True
@@ -3734,11 +4341,11 @@ def run_converged_valid_grid(
                             reason += ":" + str(payload["error"])
                         elif rc is not None:
                             reason += f":returncode={rc}"
-                        if meta["mode"] == "support_upgrade" and meta["baseline"] is not None:
+                        if meta["mode"] != "central" and meta["baseline"] is not None:
                             audited = _incomplete_audit_from_baseline(meta["baseline"], reason, worker_failure=True)
                         else:
                             audited = _failed_audit_row(meta["m_dm"], meta["eps"], reason)
-                        audited["central_estimate_recovered"] = bool(meta["mode"] == "support_upgrade")
+                        audited["central_estimate_recovered"] = bool(meta["mode"] != "central")
                         audited["worker_elapsed_s"] = float(elapsed)
                         audited["worker_pid"] = int(pid)
                         audited["module_version"] = MODULE_VERSION
@@ -3794,6 +4401,7 @@ def run_converged_valid_grid(
         row["point_ordinal"] = int(ordinal)
         ordered_rows.append(row)
     result = pd.DataFrame(ordered_rows)
+    result = add_asymptotic_tail_diagnostics(result, conv)
     result = add_result_classifications(result, conv)
     central_complete = int(sum(_has_finite_central_estimate(r) for r in ordered_rows))
     adaptive_complete = int(sum(_has_current_adaptive_bmax_audit(r, conv) for r in ordered_rows))
